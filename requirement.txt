@@ -1,23 +1,35 @@
+# ==========================================
+# Core Dependencies
+# ==========================================
 flask
 flask-cors
 pymongo
 groq
-torch
-transformers
-accelerate
-safetensors
-sentencepiece
-langchain==0.2.16
-langchain-community==0.2.16
-langchain-core==0.2.38
-langchain-huggingface
-langchain-qdrant
-qdrant-client
 pypdf
 PyPDF2
-sentence-transformers
-huggingface_hub
-
 python-dotenv
 boto3
 gunicorn
+requests
+
+# ==========================================
+# PIPELINE 1: Vectorless RAG (Active for Render 500MB Free Tier)
+# ==========================================
+pageindex
+
+# ==========================================
+# PIPELINE 2: Traditional Vector RAG (Commented out for future toggle)
+# ==========================================
+# torch
+# transformers
+# accelerate
+# safetensors
+# sentencepiece
+# sentence-transformers
+# huggingface_hub
+# langchain==0.2.16
+# langchain-community==0.2.16
+# langchain-core==0.2.38
+# langchain-huggingface
+# langchain-qdrant
+# qdrant-client

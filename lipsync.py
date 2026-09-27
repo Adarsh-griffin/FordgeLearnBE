@@ -261,10 +261,16 @@ def poll_video(video_id: str, interval: int = 5, timeout: int = 600):
     def _do_poll(api_key, vid, intr, to):
         headers = {"x-api-key": api_key}
         t0 = time.time()
+        poll_count = 0
+        last_status = None
+        
         while True:
+            poll_count += 1
+            elapsed = time.time() - t0
+            
             r = requests.get(VIDEOS_GET(vid), headers=headers, timeout=20)
             if r.status_code != 200:
-                print("Poll error:", r.status_code, r.text)
+                print(f"Poll error (attempt {poll_count}, elapsed={elapsed:.0f}s): {r.status_code} {r.text}")
                 if r.status_code == 404:
                     raise FileNotFoundError(f"Video {vid} not found (404).")
                 # If 401/403, we might want to rotate. 
@@ -274,13 +280,24 @@ def poll_video(video_id: str, interval: int = 5, timeout: int = 600):
             
             data = r.json()
             status = data.get("status")
-            print(f"[poll] status={status}")
+            
+            # Show progress every 30 seconds or when status changes
+            if status != last_status or poll_count == 1 or int(elapsed) % 30 == 0:
+                print(f"[poll #{poll_count}] status={status}, elapsed={elapsed:.0f}s/{to}s, video_id={vid[:10]}...")
+                last_status = status
+            else:
+                # Brief progress indicator
+                if poll_count % 6 == 0:  # Every ~30 seconds with 5s interval
+                    print(f"[poll] Still {status}... ({elapsed:.0f}s elapsed)")
+            
             if status == "ready":
+                print(f"✅ Video ready after {elapsed:.0f}s and {poll_count} polls")
                 return data
             if status == "error":
-                raise RuntimeError("Tavus returned error: " + json.dumps(data))
-            if time.time() - t0 > to:
-                raise TimeoutError("Timed out waiting for Tavus video")
+                error_msg = data.get("error_message", "No error message provided")
+                raise RuntimeError(f"Tavus returned error: {error_msg} | Full response: {json.dumps(data)}")
+            if elapsed > to:
+                raise TimeoutError(f"Timed out waiting for Tavus video after {elapsed:.0f}s ({poll_count} polls). Last status: {status}")
             time.sleep(intr)
 
     # Note: polling is a long running process. If we rotate key mid-poll, we restart polling.

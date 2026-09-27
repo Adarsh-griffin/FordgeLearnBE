@@ -11,9 +11,11 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from pymongo import MongoClient
 import gridfs
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
-from retrieval import get_relevant_docs
+# LangChain RetrievalQA commented out for Vectorless RAG
+# from langchain.chains import RetrievalQA
+# from langchain.prompts import PromptTemplate
+from retrieval import retrieve_pageindex_context, get_relevant_docs
+from ingest import ingest_document
 from groq import Groq, GroqError
 from pathlib import Path
 # from faster_whisper import WhisperModel  # Local STT disabled; using Groq hosted Whisper
@@ -57,9 +59,58 @@ GROQ_API_KEYS = [k.strip() for k in GROQ_API_KEYS_STR.split(',') if k.strip()]
 if not GROQ_API_KEYS:
      raise ValueError("No valid GROQ_API_KEYs found after splitting by comma.")
 
-print(f"Loaded {len(GROQ_API_KEYS)} Groq API keys.")
-
 _current_key_index = 0
+
+# ---------------- API Keys Debug Verification ----------------
+def verify_and_log_api_keys():
+    print("================================================================================")
+    print("[API-KEYS] API KEYS & ENVIRONMENT SETUP VERIFICATION")
+    print("================================================================================")
+    
+    # 1. Groq Keys
+    groq_keys = os.getenv("GROQ_API_KEY", "")
+    if groq_keys:
+        count = len([k for k in groq_keys.split(",") if k.strip()])
+        print(f"[API KEY LOADED] [OK] Groq API Keys loaded successfully (Count: {count})")
+    else:
+        print("[API KEY WARNING] [WARNING] GROQ_API_KEY is missing in .env")
+
+    # 2. PageIndex Key
+    pageindex_key = os.getenv("PAGEINDEX_API_KEY", "")
+    if pageindex_key:
+        print(f"[API KEY LOADED] [OK] PageIndex API Key loaded successfully")
+    else:
+        print("[API KEY LOADED] [OK] PageIndex Vectorless RAG active (Using Groq Fallback)")
+
+    # 3. Tavus Key
+    tavus_key = os.getenv("TAVUS_API_KEY", "")
+    if tavus_key:
+        print(f"[API KEY LOADED] [OK] Tavus Lipsync Video API Key loaded successfully")
+    else:
+        print("[API KEY WARNING] [WARNING] TAVUS_API_KEY is missing in .env")
+
+    # 4. Fal.ai Key
+    fal_key = os.getenv("FAL_API_KEY", "")
+    if fal_key:
+        print(f"[API KEY LOADED] [OK] Fal.ai Kokoro TTS API Key loaded successfully")
+    else:
+        print("[API KEY WARNING] [WARNING] FAL_API_KEY is missing in .env")
+
+    # 5. AWS S3 Credentials
+    aws_key = os.getenv("AWS_ACCESS_KEY_ID", "")
+    aws_bucket = os.getenv("AWS_AUDIO_BUCKET", "")
+    if aws_key and aws_bucket:
+        print(f"[API KEY LOADED] [OK] AWS S3 Credentials & Bucket ('{aws_bucket}') loaded successfully")
+    else:
+        print("[API KEY WARNING] [WARNING] AWS S3 credentials missing in .env")
+
+    # 6. MongoDB Database
+    mongo_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
+    mongo_db = os.getenv("MONGO_DB_NAME", "neurolearn")
+    print(f"[DATABASE CONNECT] [OK] Target MongoDB database: '{mongo_db}' at {mongo_uri}")
+    print("================================================================================\n")
+
+verify_and_log_api_keys()
 
 def get_current_groq_client():
     global _current_key_index
@@ -121,26 +172,46 @@ def groq_generate(prompt, max_tokens=512, temperature=0.7):
 
 llm = groq_generate
 
-from langchain.llms.base import LLM
-from typing import Any, List, Optional
+# LangChain GroqLLM wrapper commented out for Vectorless RAG
+# from langchain.llms.base import LLM
+# class GroqLLM(LLM):
+#     def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+#         return groq_generate(prompt)
 
-class GroqLLM(LLM):
-    """LangChain wrapper for Groq's groq_generate function."""
-
-    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
-        return groq_generate(prompt)
-
-    @property
-    def _identifying_params(self) -> dict:
-        return {"name": "GroqLLM"}
-
-    @property
-    def _llm_type(self) -> str:
-        return "groq"
-
-# ---------------- Flask Setup ----------------
+# ---------------- Flask Setup & FE-BE Connection Logging ----------------
 app = Flask(__name__)
-CORS(app)  # Enable CORS for React frontend
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+
+import time
+from flask import g
+
+@app.before_request
+def log_request_start():
+    g.start_time = time.time()
+    origin = request.headers.get('Origin', 'Direct/Same-Origin')
+    print(f"\n[FE-BE CONNECT] Inbound {request.method} request to '{request.path}' from Origin: {origin} (IP: {request.remote_addr})")
+    try:
+        if request.is_json and request.json:
+            keys = list(request.json.keys())
+            print(f"[FE-BE CONNECT] Payload keys: {keys}")
+    except Exception:
+        pass
+
+@app.after_request
+def log_request_end(response):
+    duration = round(time.time() - getattr(g, 'start_time', time.time()), 3)
+    print(f"[FE-BE CONNECT] Outbound response {request.method} '{request.path}' -> Status {response.status_code} (Duration: {duration}s)\n")
+    return response
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Explicit health check endpoint for frontend connection status."""
+    return jsonify({
+        "status": "ok",
+        "backend": "connected",
+        "mongo": "connected" if client else "disconnected",
+        "timestamp": datetime.utcnow().isoformat()
+    }), 200
 
 # ---------------- Configuration for Uploads and MongoDB ----------------
 UPLOAD_FOLDER = 'uploads'
@@ -163,9 +234,9 @@ try:
     files_collection = db['files']
     fs = gridfs.GridFS(db, collection="tts_audio")
     client.server_info()
-    print("✅ MongoDB connection successful.")
+    print("[OK] MongoDB connection successful.")
 except Exception as e:
-    print(f"❌ Could not connect to MongoDB: {e}")
+    print(f"[ERROR] Could not connect to MongoDB: {e}")
     client = None
     fs = None
 
@@ -200,13 +271,6 @@ def serialize_datetime(value):
         return value.isoformat() + ("Z" if value.tzinfo is None else "")
     return value
 
-
-# ---------------- Helper ----------------
-def extract_helpful_answer(text):
-    match = re.search(r"Helpful Answer:\s*(.*?)(?:\n\s*Question:|\Z)", text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return text.strip()
 
 # ===================================================================================================================================
 # ---------------- Upload ----------------
@@ -266,11 +330,16 @@ def upload_file():
 def check_processing_status(filename):
     """Check if file processing is complete by looking for explanation in MongoDB."""
     try:
+        from urllib.parse import unquote
+        
         if not client:
             return jsonify({"error": "Database connection is not available."}), 500
         
+        # Decode URL-encoded filename (handles spaces and special characters)
+        decoded_filename = unquote(filename)
+        
         # Find the file document
-        file_doc = files_collection.find_one({"originalName": filename})
+        file_doc = files_collection.find_one({"originalName": decoded_filename})
         
         if not file_doc:
             return jsonify({"status": "not_found", "message": "File not found"}), 404
@@ -377,18 +446,16 @@ def ask_question():
 
     if not query:
         return jsonify({'error': 'No question provided'}), 400
-    if not file_name:
-        return jsonify({'error': 'No file name provided for context'}), 400
-        
     collection_name = os.path.splitext(os.path.basename(file_name))[0].lower().replace(" ", "_")
 
     try:
-        retriever = get_relevant_docs(query, collection_name)
+        # Vectorless PageIndex RAG retrieval
+        retrieved = retrieve_pageindex_context(query, collection_name)
+        context = retrieved.get("context", "")
+        citations = retrieved.get("citations", [])
 
-        # 1. NEW HUMAN-LIKE TEMPLATE
-        # We use {context} and {question} placeholders for the RetrievalQA chain
-        template = """
-        Use the context to explain the topic for a student using a clear, bulleted list. 
+        prompt = f"""
+        Use the following document context to explain the topic for a student using a clear, bulleted list. 
         Follow these style rules:
         Rules for Pointers:
         1. Every bullet point MUST start with a dash and a single space (Example: "- Item").
@@ -396,39 +463,22 @@ def ask_question():
         3. Ensure there is an empty line before starting a list.
         - Use a short introductory sentence.
         - Use bullet points for key features or steps.
-        - Use bold text **only** for the names of parts or specific terms.
+        - Use bold text **only** for technical terms or specific concepts.
+        - Mention exact page sources when applicable.
         - Keep the language simple and easy to memorize.
         - Do not use a summary or conclusion at the end.
-        
 
         Context: {context}
-        Question: {question}
+        Question: {query}
         Answer:"""
 
-        prompt = PromptTemplate(
-            template=template, 
-            input_variables=["context", "question"]
-        )
+        final_answer = groq_generate(prompt).strip()
 
-        # 2. UPDATED CHAIN CONFIGURATION
-        qa = RetrievalQA.from_chain_type(
-            llm=GroqLLM(),
-            chain_type="stuff",
-            retriever=retriever,
-            return_source_documents=False,
-            # This is key: it injects our clean prompt into the RAG process
-            chain_type_kwargs={"prompt": prompt} 
-        )
-
-        # 3. INVOKE AND CLEAN RESPONSE
-        # Note: We pass the raw query here; the chain handles the prompt formatting
-        response = qa.invoke({"query": query}) 
-        
-        # We remove 'textwrap.fill' and 'extract_helpful_answer' to keep the 
-        # text natural and avoid the 'fixed-width' terminal look.
-        final_answer = response['result'].strip()
-
-        return jsonify({'response': final_answer})
+        return jsonify({
+            'response': final_answer,
+            'citations': citations,
+            'section': retrieved.get("section_title", "")
+        })
         
     except Exception as e:
         import traceback
@@ -523,7 +573,7 @@ def learning_tts():
     try:
         data = request.get_json(force=True)
         text = (data or {}).get('text', '').strip()
-        voice = (data or {}).get('voice', 'Aaliyah-PlayAI')
+        voice = (data or {}).get('voice', 'Nia-PlayAI')
         model = (data or {}).get('model', 'playai-tts')
         file_name_req = (data or {}).get('fileName') or (data or {}).get('file_name')
         print(f"[PLAYAI-TTS] Incoming request: fileName={file_name_req}, text_len={len(text)}")
@@ -798,7 +848,7 @@ def qa_tts():
     try:
         data = request.get_json(force=True)
         text = (data or {}).get('text', '').strip()
-        voice = (data or {}).get('voice', 'Aaliyah-PlayAI')
+        voice = (data or {}).get('voice', 'Nia-PlayAI')
         fmt = (data or {}).get('format', 'wav')
 
         if not text:
@@ -988,14 +1038,10 @@ def qa_voice():
 
         # Route through existing QA pipeline with retrieval context
         collection_name = os.path.splitext(os.path.basename(file_name_ctx))[0].lower().replace(" ", "_")
-        retriever = get_relevant_docs(effective_query, collection_name)
-        # qa = RetrievalQA.from_chain_type(
-        #     llm=GroqLLM(),
-        #     chain_type="stuff",
-        #     retriever=retriever,
-        #     return_source_documents=False
-        # )
-        template = """
+        retrieved = retrieve_pageindex_context(effective_query, collection_name)
+        context = retrieved.get("context", "")
+        
+        prompt = f"""
         Use the following pieces of context to explain the topic to a student using clear pointers.
         Rules for Pointers:
         1. Every bullet point MUST start with a dash and a single space (Example: "- Item").
@@ -1011,21 +1057,10 @@ def qa_voice():
         - Keep the tone professional but very easy to understand.
 
         Context: {context}
-        Question: {question}
+        Question: {effective_query}
         Answer:"""
-        prompt_obj = PromptTemplate(
-            template=template, 
-            input_variables=["context", "question"]
-        )
-        qa = RetrievalQA.from_chain_type(
-            llm=GroqLLM(),
-            chain_type="stuff",
-            retriever=retriever,
-            return_source_documents=False,
-            chain_type_kwargs={"prompt": prompt_obj}
-        )
-        qa_resp = qa.invoke({"query": effective_query})
-        answer_text = qa_resp['result'].strip()
+
+        answer_text = groq_generate(prompt).strip()
         print(f"[QA-VOICE] Answer: {answer_text}")
 
         # Optional: TTS placeholder (Kokoro not wired yet)

@@ -52,7 +52,7 @@ def get_educational_images(query):
     """
     payload = json.dumps({
         "q": f"{query} educational diagram",
-        "num": 4,
+        "num": 10,  # Get 10 images to have more candidates
         "autocorrect": True,
         "safe": "active"
     })
@@ -108,22 +108,34 @@ def generate_keywords_from_summary(summary_text):
 def upload_image_to_s3(image_url, folder="default", target_filename=None):
     """
     Downloads image from URL, converts to PNG, and uploads to S3.
-    Returns the public S3 URL.
+    Returns the public S3 URL on success, None on failure.
     """
     if not AWS_AUDIO_BUCKET:
-        print("AWS_AUDIO_BUCKET not set, skipping upload")
-        return image_url
+        print("  ⚠️  AWS_AUDIO_BUCKET not set, skipping upload")
+        return None
 
     try:
-        # Download image
-        resp = requests.get(image_url, stream=True, timeout=10)
+        # Download image with timeout
+        print(f"  📥 Downloading: {image_url[:80]}...")
+        resp = requests.get(image_url, stream=True, timeout=15, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
         resp.raise_for_status()
+        
+        # Check content type (but allow empty/missing for some sources)
+        content_type = resp.headers.get('content-type', '').lower()
+        
+        # Some image CDNs don't send proper Content-Type, so we'll try to validate with PIL
+        if content_type and not content_type.startswith('image/'):
+            # Only reject if we have a Content-Type and it's definitely not an image
+            if content_type.startswith(('text/', 'application/json', 'application/xml')):
+                print(f"  ❌ Invalid content type: {content_type}")
+                return None
         
         # Determine filename
         if target_filename:
             s3_key = f"{AWS_IMAGE_PREFIX}/{folder}/{target_filename}"
         else:
-            # Fallback
             parsed = urlparse(image_url)
             filename = os.path.basename(parsed.path)
             if not filename:
@@ -131,34 +143,59 @@ def upload_image_to_s3(image_url, folder="default", target_filename=None):
             safe_name = secure_filename(filename)
             s3_key = f"{AWS_IMAGE_PREFIX}/{folder}/{safe_name}"
 
-        # Convert to PNG using Pillow
-        image_data = BytesIO(resp.content)
-        img = Image.open(image_data)
+        # Convert to PNG using Pillow (also validates it's a real image)
+        try:
+            image_data = BytesIO(resp.content)
+            img = Image.open(image_data)
+            img.verify()  # Verify it's a valid image
+            
+            # Re-open for processing (verify() closes the image)
+            image_data.seek(0)
+            img = Image.open(image_data)
+        except Exception as e:
+            print(f"  ❌ Invalid image file: {str(e)[:60]}")
+            return None
         
-        # Convert to RGB if necessary (e.g. for RGBA or P modes if saving as JPEG, but PNG handles RGBA)
-        # Just ensuring it is loaded
+        # Convert RGBA to RGB if saving with transparency issues
+        if img.mode in ('RGBA', 'LA', 'P'):
+            # Keep transparency for PNG
+            pass
         
         out_img = BytesIO()
         img.save(out_img, format='PNG')
         out_img.seek(0)
         
-        # Upload
+        # Upload to S3
+        print(f"  ☁️  Uploading to S3: {s3_key}")
         s3 = boto3.client('s3', region_name=AWS_REGION)
         s3.upload_fileobj(
             out_img,
             AWS_AUDIO_BUCKET,
             s3_key,
-            ExtraArgs={'ContentType': 'image/png'}
+            ExtraArgs={
+                'ContentType': 'image/png'
+                # Note: ACL not set - bucket uses bucket policy for public access
+            }
         )
         
-        # Construct URL
+        # Construct public URL
         if AWS_REGION == 'us-east-1':
-            return f"https://{AWS_AUDIO_BUCKET}.s3.amazonaws.com/{s3_key}"
-        return f"https://{AWS_AUDIO_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
+            s3_url = f"https://{AWS_AUDIO_BUCKET}.s3.amazonaws.com/{s3_key}"
+        else:
+            s3_url = f"https://{AWS_AUDIO_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
         
+        print(f"  ✅ Uploaded successfully")
+        return s3_url
+        
+    except requests.exceptions.Timeout:
+        print(f"  ❌ Timeout downloading image from {image_url[:60]}...")
+        return None
+    except requests.exceptions.HTTPError as e:
+        print(f"  ❌ HTTP error {e.response.status_code} downloading image")
+        return None
     except Exception as e:
-        print(f"Failed to upload {image_url} to S3: {e}")
-        return image_url # Fallback to original URL. NOTE: Frontend might fail if it strictly expects PNG from bucket
+        print(f"  ❌ Failed to upload {image_url[:60]}... to S3: {str(e)[:100]}")
+        return None
 
 def process_images_for_file(file_path, summary_text):
     """
@@ -186,32 +223,40 @@ def process_images_for_file(file_path, summary_text):
     for kw in keywords:
         imgs = get_educational_images(kw)
         if imgs:
-            # Take the top 1 valid image for each keyword
-            all_images.append(imgs[0])
+            # Collect ALL images from each keyword (up to 10)
+            all_images.extend(imgs)
             
     # Deduplicate
     unique_images = list(dict.fromkeys(all_images))
-    print(f"🔍 Found {len(unique_images)} images.")
+    print(f"🔍 Found {len(unique_images)} unique image candidates.")
     
-    # 3. Upload to S3
-    print("Step 3: Uploading to S3...")
+    # 3. Upload to S3 - Try all images but keep only first 4 successful
+    print("Step 3: Uploading to S3 (trying all, keeping best 4)...")
     final_urls = []
     
     # Clean up base file name for the folder and the image prefix
-    # file_path might be "uploads\jesc110.pdf"
-    base_filename_full = os.path.basename(file_path) # jesc110.pdf
-    base_name_clean = os.path.splitext(base_filename_full)[0] # jesc110
-    safe_folder = secure_filename(base_name_clean) # jesc110
+    base_filename_full = os.path.basename(file_path)
+    base_name_clean = os.path.splitext(base_filename_full)[0]
+    safe_folder = secure_filename(base_name_clean)
     
-    # For the individual image files, user wants: "jesc 110 learning-image-1"
-    # I will use safe names: "jesc110-learning-image-1.png"
-    
+    image_counter = 1
     for i, img_url in enumerate(unique_images):
-        target_name = f"{safe_folder}-learning-image-{i+1}.png"
+        # Stop once we have 4 successful uploads
+        if len(final_urls) >= 4:
+            print(f"\n✅ Successfully uploaded 4 images, stopping.")
+            break
+            
+        print(f"\n🖼️  Trying candidate {i+1}/{len(unique_images)}...")
+        target_name = f"{safe_folder}-learning-image-{image_counter}.png"
         
         s3_url = upload_image_to_s3(img_url, folder=safe_folder, target_filename=target_name)
-        final_urls.append(s3_url)
-        print(f"✅ Image Ready: {s3_url}")
+        
+        if s3_url:
+            final_urls.append(s3_url)
+            print(f"✅ Image {image_counter} uploaded: {s3_url}")
+            image_counter += 1
+        else:
+            print(f"⚠️  Candidate {i+1} failed, trying next...")
         
     # 4. Update MongoDB
     print("Step 4: Updating MongoDB...")
