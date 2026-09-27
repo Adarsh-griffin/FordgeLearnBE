@@ -120,14 +120,17 @@ def save_explanation_to_mongo(file_path, explanation):
         print(f"[PASSMAIN] [OK] Fallback update by originalName '{base_name}': {result2.modified_count} doc modified.")
 
 def process_file():
-    print("\n[PASSMAIN] =========== [START] Processing Document Explanations ===========")
+    print("\n[PASSMAIN] =========== [START] Processing Document Summary & Explanations ===========")
+    # Brief pause to allow ingest.py to complete writing metadata & page_index to MongoDB
+    time.sleep(2)
+    
     file_doc = get_latest_pdf_doc()
     if not file_doc:
         print("[PASSMAIN] [WARNING] No PDF document found in MongoDB to process.")
         return
 
     pdf_path = os.path.normpath(file_doc.get("filePath", ""))
-    print(f"[PASSMAIN] Processing file: '{pdf_path}'")
+    print(f"[PASSMAIN] Fetching document for summary: '{pdf_path}'")
 
     if not os.path.exists(pdf_path):
         print(f"[PASSMAIN] [ERROR] File does not exist at path: '{pdf_path}'")
