@@ -7,7 +7,11 @@ from datetime import datetime
 from pymongo import MongoClient
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv, find_dotenv
-from groq import Groq
+# Shared key-rotation/retry client (was a duplicated copy of the same logic -
+# see groq_client.py). Runs as its own subprocess (see test_groq.py's
+# subprocess.Popen call), so this has no shared in-process state with
+# test_groq.py's own rotation.
+from groq_client import get_client as get_current_groq_client, rotate_key, execute_with_retry
 
 # Load environment
 load_dotenv(find_dotenv())
@@ -22,38 +26,6 @@ MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "neurolearn")
 client = MongoClient(MONGO_URI)
 db = client[MONGO_DB_NAME]
 collection = db["files"]
-
-# Groq Setup with API key rotation
-GROQ_API_KEYS_STR = os.getenv("GROQ_API_KEY", "")
-GROQ_API_KEYS = [k.strip() for k in GROQ_API_KEYS_STR.split(',') if k.strip()]
-
-if not GROQ_API_KEYS:
-    raise ValueError("GROQ_API_KEY environment variable is required.")
-
-_current_key_index = 0
-
-def get_current_groq_client():
-    global _current_key_index
-    return Groq(api_key=GROQ_API_KEYS[_current_key_index])
-
-def rotate_key():
-    global _current_key_index
-    if GROQ_API_KEYS:
-        _current_key_index = (_current_key_index + 1) % len(GROQ_API_KEYS)
-        print(f"[PASSMAIN] Rotating to Groq API key index: {_current_key_index}")
-
-def execute_with_retry(func, *args, **kwargs):
-    max_retries = len(GROQ_API_KEYS)
-    last_exception = None
-    for attempt in range(max_retries):
-        try:
-            client_instance = get_current_groq_client()
-            return func(client_instance, *args, **kwargs)
-        except Exception as e:
-            print(f"[PASSMAIN] Attempt {attempt + 1} failed with key index {_current_key_index}: {e}")
-            last_exception = e
-            rotate_key()
-    raise last_exception
 
 def groq_generate(prompt, max_tokens=700, temperature=0.7):
     """Send prompt to Groq API using supported model."""

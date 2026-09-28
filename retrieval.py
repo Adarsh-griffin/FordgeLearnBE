@@ -2,7 +2,9 @@ import os
 import json
 from pymongo import MongoClient
 from dotenv import load_dotenv, find_dotenv
-from groq import Groq
+# Shared key-rotation/retry client (see groq_client.py). Behavior preserved:
+# this module still just grabs whichever key is currently active.
+from groq_client import get_client as get_groq_client
 
 # Load environment variables
 load_dotenv(find_dotenv())
@@ -10,15 +12,6 @@ load_dotenv(find_dotenv())
 # MongoDB configuration
 MONGO_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "neurolearn")
-
-# Groq client for reasoning-based retrieval
-GROQ_API_KEYS_STR = os.getenv("GROQ_API_KEY", "")
-GROQ_KEYS = [k.strip() for k in GROQ_API_KEYS_STR.split(",") if k.strip()]
-
-def get_groq_client():
-    if not GROQ_KEYS:
-        raise ValueError("GROQ_API_KEY is not configured in .env file.")
-    return Groq(api_key=GROQ_KEYS[0])
 
 def get_pageindex_document(collection_name):
     """Fetches the document payload (page_index tree and page texts) from MongoDB."""

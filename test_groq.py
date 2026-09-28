@@ -44,22 +44,10 @@ else:
 
 # ---------------- Groq Setup ----------------
 from groq import Groq
-
-# Initialize Groq clients (supports multiple API keys for rotation)
-# Load API keys from environment variables
-GROQ_API_KEYS_STR = os.getenv("GROQ_API_KEY", "")
-if not GROQ_API_KEYS_STR:
-    raise ValueError(
-        "GROQ_API_KEY environment variable is required.\n"
-        "Make sure you have added GROQ_API_KEY to your OS environment or to a .env file.\n"
-        "If you keep a .env at the repo root, run this script from the repo root or ensure the .env is discovered (we searched parent folders)."
-    )
-
-GROQ_API_KEYS = [k.strip() for k in GROQ_API_KEYS_STR.split(',') if k.strip()]
-if not GROQ_API_KEYS:
-     raise ValueError("No valid GROQ_API_KEYs found after splitting by comma.")
-
-_current_key_index = 0
+# Shared key-rotation/retry logic (was duplicated across ingest.py,
+# retrieval.py, passmain_groq.py and this file - see groq_client.py).
+from groq_client import get_client as get_current_groq_client, rotate_key, execute_with_retry
+from clerk_auth import require_auth
 
 # ---------------- API Keys Debug Verification ----------------
 def verify_and_log_api_keys():
@@ -112,42 +100,7 @@ def verify_and_log_api_keys():
 
 verify_and_log_api_keys()
 
-def get_current_groq_client():
-    global _current_key_index
-    return Groq(api_key=GROQ_API_KEYS[_current_key_index])
-
-def rotate_key():
-    global _current_key_index
-    _current_key_index = (_current_key_index + 1) % len(GROQ_API_KEYS)
-    print(f"Rotating to Groq API key index: {_current_key_index}")
-
-def execute_with_retry(func, *args, **kwargs):
-    """
-    Execute a function that uses the Groq client.
-    If it fails with a rate limit or auth error, rotate the key and retry.
-    """
-    max_retries = len(GROQ_API_KEYS)
-    last_exception = None
-    
-    for attempt in range(max_retries):
-        try:
-            client = get_current_groq_client()
-            # Pass the client to the function if it expects it, 
-            # or rely on the function using the global client if we were using one.
-            # However, since we are rotating, we should pass the client explicitly or 
-            # have the function ask for a client.
-            # A better pattern here is to pass the client to the callback.
-            return func(client, *args, **kwargs)
-        except Exception as e:
-            # Check for specific Groq errors if possible, e.g. 429 or 401
-            # For now, we catch generic Exception but you might want to be more specific
-            print(f"Attempt {attempt + 1} failed with key index {_current_key_index}: {e}")
-            last_exception = e
-            rotate_key()
-    
-    raise last_exception
-
-groq_client = get_current_groq_client() # Initial client for backward compatibility if needed
+groq_client = get_current_groq_client()  # Initial client for backward compatibility if needed
 
 def groq_generate(prompt, max_tokens=512, temperature=0.7):
     """Send a prompt to Groq and return the response text."""
@@ -180,7 +133,15 @@ llm = groq_generate
 
 # ---------------- Flask Setup & FE-BE Connection Logging ----------------
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+# allow_headers set explicitly so the AI Tutor's Authorization/X-Anonymous-Id
+# headers aren't stripped by the CORS preflight (default only reflects a
+# smaller safelist).
+CORS(
+    app,
+    resources={r"/*": {"origins": "*"}},
+    supports_credentials=True,
+    allow_headers=["Content-Type", "Authorization", "X-Anonymous-Id"],
+)
 
 import time
 from flask import g
@@ -228,19 +189,43 @@ if not os.path.exists(TTS_OUTPUT_FOLDER):
 FAL_API_KEY = os.getenv("FAL_API_KEY")
 FAL_KOKORO_URL = os.getenv("FAL_KOKORO_URL", "https://api.fal.ai/kokoro/tts")
 
+# NOTE: this used to hardcode 'mongodb://localhost:27017/neurolearn' regardless
+# of MONGODB_URI/MONGO_DB_NAME in .env - meaning if .env pointed at Atlas (as it
+# does here), this process was silently reading/writing a totally different,
+# empty local database than ingest.py/retrieval.py/passmain_groq.py. Fixed to
+# use the same env vars every other module already reads.
+MONGO_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "neurolearn")
+
 try:
-    client = MongoClient('mongodb://localhost:27017/')
-    db = client['neurolearn']
+    client = MongoClient(MONGO_URI)
+    db = client[MONGO_DB_NAME]
     files_collection = db['files']
     fs = gridfs.GridFS(db, collection="tts_audio")
     client.server_info()
-    print("[OK] MongoDB connection successful.")
+    print(f"[OK] MongoDB connection successful. (db='{MONGO_DB_NAME}')")
 except Exception as e:
     print(f"[ERROR] Could not connect to MongoDB: {e}")
     client = None
     fs = None
 
 # ---------------- Collection helpers ----------------
+def resolve_file_by_id(file_id: str):
+    """
+    Look up a `files` document by its Mongo _id. This is the canonical file
+    identifier for new AI Tutor endpoints (see Phase 0 of the tutor plan) -
+    it sidesteps the collection_name mismatch between ingest.py's slug
+    (lowercase + strip to [a-z0-9_]) and other modules' looser slugging by
+    never recomputing a slug at all.
+    """
+    from bson import ObjectId
+    from bson.errors import InvalidId
+    try:
+        return files_collection.find_one({"_id": ObjectId(file_id)})
+    except (InvalidId, TypeError):
+        return None
+
+
 def resolve_file_context(file_name_req: str | None = None):
     """Return (file_doc, safe_folder_name) for downstream storage."""
     file_doc = None
@@ -371,10 +356,27 @@ def get_files():
     if not client:
         return jsonify({"error": "Database connection is not available."}), 500
     try:
-        # Find all documents and only return the originalName field, sorted by date
-        files = list(files_collection.find({}, {"_id": 0, "originalName": 1}).sort("uploadDate", -1))
-        file_names = [f['originalName'] for f in files]
-        return jsonify(file_names)
+        # NOTE: this used to return a bare list of filename strings. The
+        # frontend's FileInfo interface (client/lib/api.ts) already declared
+        # _id/uploadDate/size fields that the backend never actually sent -
+        # now it does, so a stable fileId is available for the AI Tutor
+        # endpoints instead of re-deriving a slug from the filename.
+        docs = list(
+            files_collection.find(
+                {}, {"originalName": 1, "uploadDate": 1, "fileSize": 1, "folder": 1}
+            ).sort("uploadDate", -1)
+        )
+        files = [
+            {
+                "_id": str(d["_id"]),
+                "originalName": d.get("originalName"),
+                "uploadDate": serialize_datetime(d.get("uploadDate")),
+                "size": d.get("fileSize"),
+                "folder": d.get("folder"),
+            }
+            for d in docs
+        ]
+        return jsonify(files)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1335,6 +1337,18 @@ def submit_answer():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ===================================================================================================================================
+# --- AI Tutor (Phase 0: auth wiring only - see tutor build plan) ---
+# Every route under /api/tutor/* requires a Clerk-signed session token.
+# Nothing above this line is affected: upload/QA/assessment/video stay public.
+
+@app.route('/api/tutor/ping', methods=['GET'])
+@require_auth
+def tutor_ping():
+    """Proves the Clerk auth wiring end-to-end for the frontend's placeholder Tutor tab."""
+    return jsonify({"ok": True, "user_id": g.user_id})
 
 
 # ===================================================================================================================================

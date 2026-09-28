@@ -6,7 +6,10 @@ import requests
 from pypdf import PdfReader
 from pymongo import MongoClient
 from dotenv import load_dotenv, find_dotenv
-from groq import Groq
+# Shared key-rotation/retry client (was a duplicated single-key copy here -
+# see groq_client.py). Behavior preserved: this module still just grabs
+# whichever key is currently active, no retry loop, same as before.
+from groq_client import get_client as get_groq_client
 
 # Load environment variables
 load_dotenv(find_dotenv())
@@ -15,15 +18,7 @@ load_dotenv(find_dotenv())
 MONGO_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "neurolearn")
 
-# API Keys
-GROQ_API_KEYS_STR = os.getenv("GROQ_API_KEY", "")
-GROQ_KEYS = [k.strip() for k in GROQ_API_KEYS_STR.split(",") if k.strip()]
 PAGEINDEX_API_KEY = os.getenv("PAGEINDEX_API_KEY", "").strip()
-
-def get_groq_client():
-    if not GROQ_KEYS:
-        raise ValueError("[ERROR] GROQ_API_KEY is not configured in .env file.")
-    return Groq(api_key=GROQ_KEYS[0])
 
 def check_native_toc(reader):
     """

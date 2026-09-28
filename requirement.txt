@@ -11,6 +11,7 @@ python-dotenv
 boto3
 gunicorn
 requests
+pyjwt[crypto]
 
 # ==========================================
 # PIPELINE 1: Vectorless RAG (Active for Render 500MB Free Tier)
