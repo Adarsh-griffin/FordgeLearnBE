@@ -8,7 +8,9 @@ This is the single place that owns it now; each module keeps its own thin
 prompt-calling wrapper (they differ slightly, e.g. test_groq.py's
 `reasoning_effort` param) but sources key rotation from here.
 """
+import json
 import os
+import re
 from groq import Groq
 from dotenv import load_dotenv, find_dotenv
 
@@ -57,10 +59,14 @@ def execute_with_retry(func, *args, **kwargs):
 
 def groq_generate(prompt, model="openai/gpt-oss-20b", max_tokens=512, temperature=0.7, json_mode=False):
     """
-    Generic helper for NEW code (Phase 1+ tutor endpoints). Existing modules
-    keep their own groq_generate wrappers to preserve exact prior behavior;
-    this one is for code that doesn't need to match legacy quirks.
+    Generic helper for NEW code. Existing modules (ingest.py, test_groq.py,
+    etc.) keep their own groq_generate wrappers to preserve exact prior
+    behavior; this one is for code that doesn't need to match legacy quirks.
     Returns the raw text, or a parsed dict if json_mode=True (None on failure).
+
+    Prefer groq_generate_json() below over json_mode=True for anything with
+    a nested schema (an options array, a dict of lists, etc.) - see its
+    docstring for why.
     """
     def _do_generate(client, p, mt, temp):
         kwargs = dict(
@@ -86,9 +92,50 @@ def groq_generate(prompt, model="openai/gpt-oss-20b", max_tokens=512, temperatur
     try:
         text = execute_with_retry(_do_generate, prompt, max_tokens, temperature)
         if json_mode:
-            import json
             return json.loads(text)
         return text
     except Exception as e:
         print(f"[GROQ] Error generating response after retries: {e}")
+        return None
+
+
+def groq_generate_json(prompt: str, max_tokens: int = 900, temperature: float = 0.4):
+    """
+    Plain-text completion + manual JSON parsing, instead of
+    response_format={"type": "json_object"} (what groq_generate's json_mode
+    uses). That mode proved unreliable on openai/gpt-oss-20b for nested
+    schemas (an options array, a dict of lists) - reproducibly a 400
+    json_validate_failed, every retry/key rotation, regardless of prompt
+    wording (found while building the diagnostic quiz's MCQ generation).
+    This is the preferred path for any new structured-output call.
+    Returns None on any failure - callers must treat that as "try again
+    later", never as a value to trust blindly.
+    """
+    def _do_generate(client, p, mt, temp):
+        completion = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[{"role": "user", "content": p}],
+            temperature=temp,
+            max_completion_tokens=mt,
+            top_p=1,
+            reasoning_effort="low",
+            stream=False,
+        )
+        return completion.choices[0].message.content
+
+    try:
+        text = execute_with_retry(_do_generate, prompt, max_tokens, temperature)
+    except Exception as e:
+        print(f"[GROQ] groq_generate_json failed after retries: {e}")
+        return None
+
+    if not text:
+        return None
+
+    cleaned = re.sub(r'^```(?:json)?\s*', '', text.strip())
+    cleaned = re.sub(r'\s*```$', '', cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        print(f"[GROQ] groq_generate_json: failed to parse JSON: {e}\nRaw: {cleaned[:300]}")
         return None

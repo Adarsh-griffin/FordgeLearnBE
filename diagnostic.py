@@ -18,62 +18,10 @@ can decide deterministically" principle used in knowledge_graph.py:
     wrong answer jumps back to test the least-tested prerequisite of the
     current topic (more foundational) before continuing.
 """
-import json
-import re
-
-from groq_client import execute_with_retry
+from groq_client import groq_generate_json
 from knowledge_graph import section_preview
 
 MAX_QUESTIONS = 7
-
-
-def _groq_plain_json(prompt: str, max_tokens: int = 900, temperature: float = 0.4):
-    """
-    Plain-text completion + manual JSON parsing, instead of groq_client's
-    json_mode (response_format=json_object). That mode proved unreliable
-    for this module's nested schema on openai/gpt-oss-20b - it reproducibly
-    returns a 400 json_validate_failed for the MCQ options-array shape,
-    every retry/key rotation, regardless of prompt wording. Plain text with
-    a generous token budget (gpt-oss-20b spends some of it on internal
-    reasoning tokens before any visible output - too small a budget here
-    silently returns empty content) and manual parsing is more robust.
-    Returns None on any failure - callers treat that as "try again later",
-    never as a value to trust blindly.
-    """
-    def _do_generate(client, p, mt, temp):
-        completion = client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=[{"role": "user", "content": p}],
-            temperature=temp,
-            max_completion_tokens=mt,
-            top_p=1,
-            # Without this, gpt-oss-20b can burn its ENTIRE token budget on
-            # internal reasoning and emit no visible content at all
-            # (confirmed: 1998/2000 reasoning tokens, finish_reason="length",
-            # content="") for prompts with thin/vague context - this caps
-            # that runaway. test_groq.py's own groq_generate already does
-            # the same for the same reason.
-            reasoning_effort="low",
-            stream=False,
-        )
-        return completion.choices[0].message.content
-
-    try:
-        text = execute_with_retry(_do_generate, prompt, max_tokens, temperature)
-    except Exception as e:
-        print(f"[DIAGNOSTIC] Groq generation failed after retries: {e}")
-        return None
-
-    if not text:
-        return None
-
-    cleaned = re.sub(r'^```(?:json)?\s*', '', text.strip())
-    cleaned = re.sub(r'\s*```$', '', cleaned)
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        print(f"[DIAGNOSTIC] Failed to parse JSON from Groq response: {e}\nRaw: {cleaned[:300]}")
-        return None
 
 
 def topological_order(topics: list) -> list:
@@ -176,7 +124,7 @@ fences and no extra commentary:
   "correct_key": "A"
 }}
 """
-    result = _groq_plain_json(prompt, max_tokens=900, temperature=0.4)
+    result = groq_generate_json(prompt, max_tokens=900, temperature=0.4)
     if not isinstance(result, dict):
         return None
 
@@ -214,7 +162,7 @@ In 5-10 words, name the likely misconception behind this wrong answer.
 Return ONLY a JSON object, with no markdown code fences and no extra
 commentary: {{"misconception": "..."}}
 """
-    result = _groq_plain_json(prompt, max_tokens=300, temperature=0.3)
+    result = groq_generate_json(prompt, max_tokens=300, temperature=0.3)
     if isinstance(result, dict) and isinstance(result.get("misconception"), str):
         return result["misconception"].strip() or None
     return None

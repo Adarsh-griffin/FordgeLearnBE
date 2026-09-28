@@ -17,7 +17,7 @@ test_groq.py) - this module doesn't touch MongoDB itself.
 """
 from datetime import datetime, timezone
 
-from groq_client import groq_generate
+from groq_client import groq_generate_json
 
 
 def _build_topics_from_structure(structure: list) -> list:
@@ -89,7 +89,7 @@ it has no prerequisites):
   }}
 }}
 """
-    result = groq_generate(prompt, max_tokens=1024, temperature=0.1, json_mode=True)
+    result = groq_generate_json(prompt, max_tokens=1024, temperature=0.1)
     if not isinstance(result, dict):
         return {}
     prereqs = result.get("prerequisites")

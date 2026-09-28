@@ -57,6 +57,7 @@ from diagnostic import (
     compute_weak_prerequisites,
     MAX_QUESTIONS,
 )
+from planner import generate_study_plan
 
 # ---------------- API Keys Debug Verification ----------------
 def verify_and_log_api_keys():
@@ -1648,6 +1649,67 @@ def diagnostic_answer():
     )
 
     return jsonify(_diagnostic_payload(next_topic_id, by_id, next_question_payload, questions_asked, extra=feedback))
+
+
+@app.route('/api/tutor/plan/generate', methods=['POST'])
+@require_auth
+def tutor_plan_generate():
+    """
+    Phase 3: turns topic_graph + this student's mastery (from a completed
+    diagnostic, if any - defaults to "everything unassessed" otherwise) +
+    goal + available time into a sequenced, explained study plan. Stored
+    as student_profiles.study_plan; regenerating overwrites the previous
+    plan (expected behavior if time budget/goal changes).
+    """
+    if not client:
+        return jsonify({"error": "Database connection is not available."}), 500
+
+    data = request.get_json(silent=True) or {}
+    file_id = (data.get('fileId') or '').strip()
+    available_minutes = data.get('availableMinutes')
+    if not file_id:
+        return jsonify({"error": "fileId is required"}), 400
+    try:
+        available_minutes = int(available_minutes)
+        if available_minutes <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({"error": "availableMinutes must be a positive number"}), 400
+
+    file_doc = resolve_file_by_id(file_id)
+    if not file_doc:
+        return jsonify({"error": "File not found"}), 404
+
+    topic_graph = get_or_build_topic_graph(file_doc)
+    if topic_graph is None:
+        return jsonify({
+            "error": "This document has no page_index yet - it may still be ingesting, or ingestion failed."
+        }), 409
+
+    topics = topic_graph.get("topics", [])
+    if not topics:
+        return jsonify({"error": "This document has no topics to build a plan from."}), 409
+
+    profile = student_profiles_collection.find_one({"user_id": g.user_id, "file_id": file_id})
+    mastery = (profile or {}).get("mastery", {})
+    diagnostic_log = (profile or {}).get("diagnostic_log", [])
+    goal = data.get('goal') or (profile or {}).get("goal") or "understand_topic"
+
+    study_plan = generate_study_plan(topics, mastery, goal, available_minutes, diagnostic_log)
+
+    student_profiles_collection.update_one(
+        {"user_id": g.user_id, "file_id": file_id},
+        {"$set": {
+            "user_id": g.user_id,
+            "file_id": file_id,
+            "goal": goal,
+            "study_plan": study_plan,
+            "updated_at": datetime.utcnow(),
+        }},
+        upsert=True
+    )
+
+    return jsonify(study_plan)
 
 
 # ===================================================================================================================================
