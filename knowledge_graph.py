@@ -35,8 +35,12 @@ def _build_topics_from_structure(structure: list) -> list:
     return topics
 
 
-def _section_preview(topic: dict, pages_text: list, max_chars: int = 300) -> str:
-    """Short text preview for a topic's page range, to ground prerequisite reasoning."""
+def section_preview(topic: dict, pages_text: list, max_chars: int = 300) -> str:
+    """
+    Short text preview for a topic's page range, to ground LLM reasoning
+    about it. Public (no leading underscore) because diagnostic.py reuses
+    this exact logic for question generation instead of duplicating it.
+    """
     start, end = topic["page_range"]
     if start is None:
         return topic.get("summary", "")
@@ -63,7 +67,7 @@ def _propose_prerequisites(topics: list, pages_text: list) -> dict:
         return {}
 
     topic_lines = [
-        f"{t['id']} | {t['title']} | preview: {_section_preview(t, pages_text)}"
+        f"{t['id']} | {t['title']} | preview: {section_preview(t, pages_text)}"
         for t in topics
     ]
 

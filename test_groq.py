@@ -49,6 +49,14 @@ from groq import Groq
 from groq_client import get_client as get_current_groq_client, rotate_key, execute_with_retry
 from clerk_auth import require_auth
 from knowledge_graph import extract_topic_graph
+from diagnostic import (
+    topological_order,
+    generate_diagnostic_question,
+    classify_misconception,
+    update_mastery,
+    compute_weak_prerequisites,
+    MAX_QUESTIONS,
+)
 
 # ---------------- API Keys Debug Verification ----------------
 def verify_and_log_api_keys():
@@ -202,6 +210,9 @@ try:
     client = MongoClient(MONGO_URI)
     db = client[MONGO_DB_NAME]
     files_collection = db['files']
+    # AI Tutor: one document per (user_id, file_id) - mastery, diagnostic
+    # state, weak prerequisites (see Phase 2 routes below).
+    student_profiles_collection = db['student_profiles']
     fs = gridfs.GridFS(db, collection="tts_audio")
     client.server_info()
     print(f"[OK] MongoDB connection successful. (db='{MONGO_DB_NAME}')")
@@ -209,6 +220,7 @@ except Exception as e:
     print(f"[ERROR] Could not connect to MongoDB: {e}")
     client = None
     fs = None
+    student_profiles_collection = None
 
 # ---------------- Collection helpers ----------------
 def resolve_file_by_id(file_id: str):
@@ -1341,15 +1353,41 @@ def submit_answer():
 
 
 # ===================================================================================================================================
-# --- AI Tutor (Phase 0: auth wiring only - see tutor build plan) ---
-# Every route under /api/tutor/* requires a Clerk-signed session token.
+# --- AI Tutor (see tutorplan.txt / the tutor build plan) ---
+# Every route under /api/tutor/* requires either a Clerk-signed session
+# token or an X-Anonymous-Id header (see clerk_auth.require_auth).
 # Nothing above this line is affected: upload/QA/assessment/video stay public.
 
 @app.route('/api/tutor/ping', methods=['GET'])
 @require_auth
 def tutor_ping():
-    """Proves the Clerk auth wiring end-to-end for the frontend's placeholder Tutor tab."""
+    """Proves the auth wiring end-to-end for the frontend's placeholder Tutor tab."""
     return jsonify({"ok": True, "user_id": g.user_id})
+
+
+def get_or_build_topic_graph(file_doc):
+    """
+    Shared by /api/tutor/topics and the diagnostic routes below: returns
+    the cached files.topic_graph, generating and persisting it first if
+    absent. Returns None if the document has no page_index yet (still
+    ingesting, or ingestion failed) - callers turn that into a 409.
+    """
+    existing = file_doc.get("topic_graph")
+    if existing and existing.get("topics"):
+        return existing
+
+    page_index = file_doc.get("page_index")
+    if not page_index or not page_index.get("structure"):
+        return None
+
+    pages_text = file_doc.get("pages_text", [])
+    topic_graph = extract_topic_graph(page_index, pages_text)
+
+    files_collection.update_one(
+        {"_id": file_doc["_id"]},
+        {"$set": {"topic_graph": topic_graph}}
+    )
+    return topic_graph
 
 
 @app.route('/api/tutor/topics', methods=['GET'])
@@ -1372,25 +1410,244 @@ def tutor_topics():
     if not file_doc:
         return jsonify({"error": "File not found"}), 404
 
-    existing = file_doc.get("topic_graph")
-    if existing and existing.get("topics"):
-        return jsonify(existing)
-
-    page_index = file_doc.get("page_index")
-    if not page_index or not page_index.get("structure"):
+    topic_graph = get_or_build_topic_graph(file_doc)
+    if topic_graph is None:
         return jsonify({
             "error": "This document has no page_index yet - it may still be ingesting, or ingestion failed."
         }), 409
 
-    pages_text = file_doc.get("pages_text", [])
-    topic_graph = extract_topic_graph(page_index, pages_text)
+    return jsonify(topic_graph)
 
-    files_collection.update_one(
-        {"_id": file_doc["_id"]},
-        {"$set": {"topic_graph": topic_graph}}
+
+def _diagnostic_payload(topic_id, by_id, question_payload, questions_asked, extra=None):
+    """Shared response shape for both diagnostic routes' "here's a question" case."""
+    payload = {
+        "done": False,
+        "topic_id": topic_id,
+        "topic_title": by_id[topic_id]["title"],
+        "question": question_payload["question"],
+        "options": question_payload["options"],
+        "questions_asked": questions_asked,
+        "max_questions": MAX_QUESTIONS,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _diagnostic_finish(profile_id, topics, mastery, probed, questions_asked, log_entry=None, notice=None):
+    """Shared "wrap up the diagnostic" logic for both diagnostic routes."""
+    weak_prerequisites = compute_weak_prerequisites(topics, mastery)
+    update = {
+        "$set": {
+            "mastery": mastery,
+            "weak_prerequisites": weak_prerequisites,
+            "diagnostic_state.status": "done",
+            "diagnostic_state.probed": probed,
+            "updated_at": datetime.utcnow(),
+        }
+    }
+    if log_entry:
+        update["$push"] = {"diagnostic_log": log_entry}
+    student_profiles_collection.update_one({"_id": profile_id}, update)
+
+    result = {
+        "done": True,
+        "mastery": mastery,
+        "weak_prerequisites": weak_prerequisites,
+        "confidence": round(min(1.0, questions_asked / max(1, len(topics))), 2),
+        "questions_asked": questions_asked,
+    }
+    if notice:
+        result["notice"] = notice
+    return result
+
+
+@app.route('/api/tutor/diagnostic/start', methods=['POST'])
+@require_auth
+def diagnostic_start():
+    """
+    Phase 2: begins an adaptive diagnostic for (this user, this file).
+    Overwrites any previous diagnostic for the same pair - starting over is
+    the expected behavior if a student restarts it.
+    """
+    if not client:
+        return jsonify({"error": "Database connection is not available."}), 500
+
+    data = request.get_json(silent=True) or {}
+    file_id = (data.get('fileId') or '').strip()
+    goal = (data.get('goal') or 'understand_topic').strip()
+    if not file_id:
+        return jsonify({"error": "fileId is required"}), 400
+
+    file_doc = resolve_file_by_id(file_id)
+    if not file_doc:
+        return jsonify({"error": "File not found"}), 404
+
+    topic_graph = get_or_build_topic_graph(file_doc)
+    if topic_graph is None:
+        return jsonify({
+            "error": "This document has no page_index yet - it may still be ingesting, or ingestion failed."
+        }), 409
+
+    topics = topic_graph.get("topics", [])
+    if not topics:
+        return jsonify({"error": "This document has no topics to build a diagnostic from."}), 409
+
+    order = topological_order(topics)
+    by_id = {t["id"]: t for t in topics}
+    pages_text = file_doc.get("pages_text", [])
+
+    first_topic_id = order[0]
+    question_payload = generate_diagnostic_question(by_id[first_topic_id], pages_text)
+    if not question_payload:
+        return jsonify({"error": "Failed to generate a diagnostic question. Please try again."}), 502
+
+    student_profiles_collection.update_one(
+        {"user_id": g.user_id, "file_id": file_id},
+        {"$set": {
+            "user_id": g.user_id,
+            "file_id": file_id,
+            "goal": goal,
+            "mastery": {},
+            "weak_prerequisites": [],
+            "diagnostic_log": [],
+            "diagnostic_state": {
+                "status": "in_progress",
+                "order": order,
+                "probed": [],
+                "questions_asked": 1,
+                "current_topic_id": first_topic_id,
+                "current_question_payload": question_payload,
+            },
+            "updated_at": datetime.utcnow(),
+        }},
+        upsert=True
     )
 
-    return jsonify(topic_graph)
+    return jsonify(_diagnostic_payload(first_topic_id, by_id, question_payload, 1))
+
+
+@app.route('/api/tutor/diagnostic/answer', methods=['POST'])
+@require_auth
+def diagnostic_answer():
+    """
+    Phase 2: grades the current diagnostic question (a plain string
+    comparison against the server-stored correct_key - never an LLM
+    decision), updates mastery with a fixed banded rule, and picks the
+    next topic by branching along the real prerequisite graph: wrong ->
+    test the least-tested prerequisite (easier/back to fundamentals),
+    correct -> advance to the next unprobed topic in prerequisite order
+    (harder/deeper). See diagnostic.py for the full rationale.
+    """
+    if not client:
+        return jsonify({"error": "Database connection is not available."}), 500
+
+    data = request.get_json(silent=True) or {}
+    file_id = (data.get('fileId') or '').strip()
+    selected_key = (data.get('selectedKey') or '').strip()
+    if not file_id or not selected_key:
+        return jsonify({"error": "fileId and selectedKey are required"}), 400
+
+    profile = student_profiles_collection.find_one({"user_id": g.user_id, "file_id": file_id})
+    if not profile or (profile.get("diagnostic_state") or {}).get("status") != "in_progress":
+        return jsonify({"error": "No diagnostic in progress for this file. Call /api/tutor/diagnostic/start first."}), 409
+
+    file_doc = resolve_file_by_id(file_id)
+    if not file_doc:
+        return jsonify({"error": "File not found"}), 404
+
+    topic_graph = get_or_build_topic_graph(file_doc)
+    topics = (topic_graph or {}).get("topics", [])
+    by_id = {t["id"]: t for t in topics}
+    pages_text = file_doc.get("pages_text", [])
+
+    state = profile["diagnostic_state"]
+    current_topic_id = state["current_topic_id"]
+    current_topic = by_id.get(current_topic_id)
+    question_payload = state["current_question_payload"]
+
+    is_correct = selected_key == question_payload.get("correct_key")
+
+    mastery = profile.get("mastery", {})
+    mastery[current_topic_id] = update_mastery(mastery.get(current_topic_id, 0.0), is_correct)
+
+    misconception = None
+    if not is_correct and current_topic:
+        misconception = classify_misconception(current_topic, question_payload, selected_key)
+
+    log_entry = {
+        "topic_id": current_topic_id,
+        "question": question_payload.get("question"),
+        "selected_key": selected_key,
+        "correct_key": question_payload.get("correct_key"),
+        "correct": is_correct,
+        "misconception": misconception,
+        "timestamp": datetime.utcnow(),
+    }
+
+    probed = state.get("probed", [])
+    if current_topic_id not in probed:
+        probed.append(current_topic_id)
+
+    order = state.get("order", [])
+    questions_asked = state.get("questions_asked", 0)
+
+    # Branch: wrong -> an untested prerequisite of the current topic (if
+    # any remain); otherwise advance to the next untested topic in order.
+    next_topic_id = None
+    if not is_correct and current_topic:
+        for pre_id in current_topic.get("prerequisites", []):
+            if pre_id in by_id and pre_id not in probed:
+                next_topic_id = pre_id
+                break
+    if not next_topic_id:
+        for tid in order:
+            if tid not in probed:
+                next_topic_id = tid
+                break
+
+    feedback = {
+        "correct": is_correct,
+        "correct_key": question_payload.get("correct_key"),
+        "misconception": misconception,
+        "answered_topic_id": current_topic_id,
+        "answered_topic_title": current_topic["title"] if current_topic else None,
+    }
+
+    if next_topic_id is None or questions_asked >= MAX_QUESTIONS:
+        result = _diagnostic_finish(profile["_id"], topics, mastery, probed, questions_asked, log_entry)
+        result.update(feedback)
+        return jsonify(result)
+
+    next_question_payload = generate_diagnostic_question(by_id[next_topic_id], pages_text)
+    if not next_question_payload:
+        # Groq failed to produce a question - end gracefully rather than
+        # leaving the student stuck with no way to proceed.
+        result = _diagnostic_finish(
+            profile["_id"], topics, mastery, probed, questions_asked, log_entry,
+            notice="Diagnostic ended early - couldn't generate another question.",
+        )
+        result.update(feedback)
+        return jsonify(result)
+
+    questions_asked += 1
+    student_profiles_collection.update_one(
+        {"_id": profile["_id"]},
+        {
+            "$set": {
+                "mastery": mastery,
+                "diagnostic_state.probed": probed,
+                "diagnostic_state.current_topic_id": next_topic_id,
+                "diagnostic_state.current_question_payload": next_question_payload,
+                "diagnostic_state.questions_asked": questions_asked,
+                "updated_at": datetime.utcnow(),
+            },
+            "$push": {"diagnostic_log": log_entry},
+        }
+    )
+
+    return jsonify(_diagnostic_payload(next_topic_id, by_id, next_question_payload, questions_asked, extra=feedback))
 
 
 # ===================================================================================================================================

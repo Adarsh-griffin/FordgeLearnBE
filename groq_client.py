@@ -69,6 +69,13 @@ def groq_generate(prompt, model="openai/gpt-oss-20b", max_tokens=512, temperatur
             temperature=temp,
             max_completion_tokens=mt,
             top_p=1,
+            # gpt-oss models can spend the ENTIRE token budget on internal
+            # reasoning and emit no visible output at all for prompts with
+            # thin/vague context (confirmed while building the diagnostic:
+            # reasoning_tokens=1998/2000, finish_reason="length", content="").
+            # test_groq.py's own hand-written groq_generate already sets
+            # this for the same reason - matching it here.
+            reasoning_effort="low",
             stream=False,
         )
         if json_mode:
