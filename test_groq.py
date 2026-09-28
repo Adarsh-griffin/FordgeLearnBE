@@ -48,6 +48,7 @@ from groq import Groq
 # retrieval.py, passmain_groq.py and this file - see groq_client.py).
 from groq_client import get_client as get_current_groq_client, rotate_key, execute_with_retry
 from clerk_auth import require_auth
+from knowledge_graph import extract_topic_graph
 
 # ---------------- API Keys Debug Verification ----------------
 def verify_and_log_api_keys():
@@ -1349,6 +1350,47 @@ def submit_answer():
 def tutor_ping():
     """Proves the Clerk auth wiring end-to-end for the frontend's placeholder Tutor tab."""
     return jsonify({"ok": True, "user_id": g.user_id})
+
+
+@app.route('/api/tutor/topics', methods=['GET'])
+@require_auth
+def tutor_topics():
+    """
+    Phase 1: returns the prerequisite topic graph for a document (see
+    knowledge_graph.py), generating and caching it on files.topic_graph the
+    first time it's requested. Cheap on repeat calls - no Groq call unless
+    the cache is empty.
+    """
+    if not client:
+        return jsonify({"error": "Database connection is not available."}), 500
+
+    file_id = request.args.get('fileId', '').strip()
+    if not file_id:
+        return jsonify({"error": "fileId query parameter is required"}), 400
+
+    file_doc = resolve_file_by_id(file_id)
+    if not file_doc:
+        return jsonify({"error": "File not found"}), 404
+
+    existing = file_doc.get("topic_graph")
+    if existing and existing.get("topics"):
+        return jsonify(existing)
+
+    page_index = file_doc.get("page_index")
+    if not page_index or not page_index.get("structure"):
+        return jsonify({
+            "error": "This document has no page_index yet - it may still be ingesting, or ingestion failed."
+        }), 409
+
+    pages_text = file_doc.get("pages_text", [])
+    topic_graph = extract_topic_graph(page_index, pages_text)
+
+    files_collection.update_one(
+        {"_id": file_doc["_id"]},
+        {"$set": {"topic_graph": topic_graph}}
+    )
+
+    return jsonify(topic_graph)
 
 
 # ===================================================================================================================================

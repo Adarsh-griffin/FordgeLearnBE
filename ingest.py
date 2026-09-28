@@ -190,6 +190,92 @@ def parse_with_pageindex_api_or_synthetic(pages_text, file_path):
             "structure": structure
         }
 
+def _extract_topic_name(base_filename: str, pages_text: list) -> str:
+    """
+    The frontend's "type a topic" flow (Study.tsx's createMinimalPdfBlob)
+    embeds "Topic: <name>" as literal text in its synthetic one-page PDF -
+    pull the exact original name/casing from there rather than reversing
+    the lossy filename slug (topicName.toLowerCase()...replace(/[^a-z0-9]/, '_')).
+    """
+    if pages_text:
+        first_page_text = pages_text[0].get("text", "")
+        match = re.search(r'Topic:\s*(.+)', first_page_text)
+        if match:
+            return match.group(1).strip().split('\n')[0]
+    # Fallback if the embedded text couldn't be parsed (still recoverable,
+    # just lossier): derive a readable name from the filename slug.
+    stem = base_filename[:-len('_topic.pdf')] if base_filename.endswith('_topic.pdf') else base_filename
+    return stem.replace('_', ' ').strip().title() or "Untitled Topic"
+
+def generate_topic_curriculum(topic_name: str, num_sections: int = 6) -> dict:
+    """
+    Topic-only mode (the "type a topic name" flow, not a real PDF upload):
+    there is no source document, so routing this through PageIndex SDK/API
+    used to submit a meaningless one-line placeholder PDF and get back an
+    empty tree (has_native_toc is always False here, has_toc is always
+    False, and the "content" is just "Topic: X" - PageIndex Cloud has
+    nothing real to vision-parse). Instead the LLM builds the curriculum
+    directly from its own knowledge of the subject. PageIndex SDK/API stay
+    exactly as before for real PDF uploads (see ingest_document).
+    """
+    client = get_groq_client()
+    prompt = f"""You are an expert curriculum designer. A student wants to learn about:
+"{topic_name}"
+
+Design a structured learning curriculum for this topic, broken into
+{num_sections} logically ordered sections a student should study in
+sequence - earlier sections should be prerequisites for later ones
+(foundational concepts first, advanced/applied concepts last).
+
+Return ONLY a valid JSON object with this exact schema:
+{{
+  "document_title": "A clear title for this learning module",
+  "structure": [
+    {{
+      "section": "1",
+      "title": "Section title",
+      "page_range": [1, 1],
+      "summary": "1-2 sentence summary of what this section covers"
+    }}
+  ]
+}}
+
+Number page_range sequentially starting at 1, one number per section
+(these are module numbers for internal ordering - there is no source PDF,
+so they are not real page numbers).
+"""
+    try:
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            response_format={"type": "json_object"}
+        )
+        data = json.loads(response.choices[0].message.content)
+        if not isinstance(data.get("structure"), list) or not data["structure"]:
+            raise ValueError("Groq returned an empty/invalid structure")
+        data["engine"] = "LLM Topic Curriculum Generator (no source document)"
+        data["has_native_toc"] = False
+        data["is_topic_mode"] = True
+        data["doc_id"] = None
+        return data
+    except Exception as e:
+        print(f"[INGEST] [ERROR] Topic curriculum generation failed: {e}")
+        # Minimal single-section fallback so ingestion doesn't hard-fail.
+        return {
+            "engine": "LLM Topic Curriculum Generator (fallback)",
+            "has_native_toc": False,
+            "is_topic_mode": True,
+            "doc_id": None,
+            "document_title": topic_name,
+            "structure": [{
+                "section": "1",
+                "title": topic_name,
+                "page_range": [1, 1],
+                "summary": f"Overview of {topic_name}."
+            }]
+        }
+
 def ingest_document(file_path):
     """
     Smart Combined PageIndex Architecture (SDK + API):
@@ -218,18 +304,29 @@ def ingest_document(file_path):
             "text": text
         })
 
-    # Step 2: Check TOC & Route
-    native_toc, has_toc = check_native_toc(reader)
-    
-    if has_toc:
-        print("[INGEST] [TOC PRESENT] Document contains native Table of Contents -> Routing via PageIndex SDK (Local Fast-Path)")
-        page_index_tree = parse_with_pageindex_sdk(native_toc, total_pages, file_path)
+    # Step 2: Route
+    base_filename = os.path.basename(file_path)
+    # The frontend's "type a topic name" flow (Study.tsx's createMinimalPdfBlob)
+    # uploads a synthetic one-page PDF named "<slug>_topic.pdf" instead of a
+    # real document. There's no real content for PageIndex SDK/API to parse
+    # in that case, so it's routed separately - PageIndex SDK/API below are
+    # otherwise completely unchanged for real PDF uploads.
+    is_topic_mode = base_filename.endswith('_topic.pdf')
+
+    if is_topic_mode:
+        topic_name = _extract_topic_name(base_filename, pages_text)
+        print(f"[INGEST] [TOPIC MODE] No source document - user typed a topic ('{topic_name}') -> Routing via LLM Topic Curriculum Generator (PageIndex skipped)")
+        page_index_tree = generate_topic_curriculum(topic_name)
     else:
-        print("[INGEST] [NO TOC DETECTED] Document lacks native Table of Contents -> Routing via PageIndex Cloud API / Synthetic Vision-TOC Engine")
-        page_index_tree = parse_with_pageindex_api_or_synthetic(pages_text, file_path)
+        native_toc, has_toc = check_native_toc(reader)
+        if has_toc:
+            print("[INGEST] [TOC PRESENT] Document contains native Table of Contents -> Routing via PageIndex SDK (Local Fast-Path)")
+            page_index_tree = parse_with_pageindex_sdk(native_toc, total_pages, file_path)
+        else:
+            print("[INGEST] [NO TOC DETECTED] Document lacks native Table of Contents -> Routing via PageIndex Cloud API / Synthetic Vision-TOC Engine")
+            page_index_tree = parse_with_pageindex_api_or_synthetic(pages_text, file_path)
 
     # Step 3: Store tree in MongoDB
-    base_filename = os.path.basename(file_path)
     collection_name = os.path.splitext(base_filename)[0].lower().replace(" ", "_")
     collection_name = re.sub(r'[^a-z0-9_]', '', collection_name)
 
