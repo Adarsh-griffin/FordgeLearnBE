@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import re
+import time
 import requests
 from pypdf import PdfReader
 from pymongo import MongoClient
@@ -88,6 +89,55 @@ def parse_with_pageindex_sdk(toc_entries, total_pages, file_path=None):
         "structure": structure
     }
 
+def _flatten_pageindex_cloud_tree(nodes: list, total_pages: int) -> list:
+    """
+    PageIndex Cloud's tree is nested - {title, page_index (a single page,
+    not a range), nodes: [...children...]} - a completely different shape
+    from the flat {section, title, page_range: [start, end], summary} list
+    every other engine here produces (and everything downstream - Phase 1's
+    knowledge_graph.py, the diagnostic, the planner, the lesson generator -
+    assumes). Confirmed by inspecting a real response: previously this was
+    returned to callers untouched, which is how a real document ended up
+    with a single "section" with page_range=None and all its actual content
+    silently discarded in unread child nodes.
+
+    Only LEAF nodes become sections (a node with children is just a
+    chapter-level grouping - its content already lives in its children).
+    page_range is derived the same way parse_with_pageindex_sdk derives it
+    from a flat TOC: each section runs up to just before the next one
+    starts, in document order.
+    """
+    leaves = []
+
+    def collect(node_list):
+        for node in node_list:
+            children = node.get("nodes") or []
+            if children:
+                collect(children)
+            else:
+                leaves.append(node)
+
+    collect(nodes)
+    leaves.sort(key=lambda n: n.get("page_index") or 0)
+
+    structure = []
+    for i, node in enumerate(leaves):
+        start_p = node.get("page_index") or 1
+        if i < len(leaves) - 1:
+            next_start = leaves[i + 1].get("page_index") or start_p
+            end_p = max(start_p, next_start - 1)
+        else:
+            end_p = max(start_p, total_pages)
+        preview = (node.get("text") or "").strip().replace("\n", " ")[:300]
+        structure.append({
+            "section": str(i + 1),
+            "title": node.get("title") or f"Section {i + 1}",
+            "page_range": [start_p, end_p],
+            "summary": preview or f"Covers page {start_p}.",
+        })
+    return structure
+
+
 def parse_with_pageindex_api_or_synthetic(pages_text, file_path):
     """
     PageIndex Cloud API / Synthetic Vision-TOC Engine (Deep-Path):
@@ -102,28 +152,45 @@ def parse_with_pageindex_api_or_synthetic(pages_text, file_path):
             submit_res = pi_client.submit_document(file_path)
             doc_id = submit_res.get("doc_id")
             print(f"[INGEST] [OK] Successfully registered document on PageIndex Cloud dashboard! Doc ID: '{doc_id}'")
-            
-            # Fetch tree structure if immediately ready
-            try:
-                tree_res = pi_client.get_tree(doc_id)
-                structure = tree_res.get("structure") or tree_res.get("result") or []
-                if structure:
-                    print(f"[INGEST] [OK] Retrieved cloud-generated PageIndex tree with {len(structure)} nodes!")
-                    return {
-                        "engine": "PageIndex Cloud API (Vision Engine)",
-                        "has_native_toc": False,
-                        "doc_id": doc_id,
-                        "structure": structure
-                    }
-            except Exception as tree_err:
-                print(f"[INGEST] [NOTICE] Tree generation processing asynchronously on PageIndex Cloud: {tree_err}")
-                
-            return {
-                "engine": "PageIndex Cloud API (Vision Engine)",
-                "has_native_toc": False,
-                "doc_id": doc_id,
-                "structure": []
-            }
+
+            # PageIndex Cloud builds the tree asynchronously. This used to
+            # check get_tree() exactly once, immediately after submission -
+            # which meant it essentially always returned an empty structure
+            # (confirmed: every document that reached this branch ended up
+            # stuck with no topic graph, no diagnostic, nothing). Poll for a
+            # while instead; this runs inside ingest.py's own background
+            # subprocess (see test_groq.py's /api/upload), so waiting here
+            # doesn't block the upload response.
+            max_wait_seconds = 60
+            poll_interval = 5
+            waited = 0
+            structure = []
+            while waited <= max_wait_seconds:
+                try:
+                    tree_res = pi_client.get_tree(doc_id)
+                    structure = tree_res.get("structure") or tree_res.get("result") or []
+                    status = str(tree_res.get("status", "")).lower()
+                    if structure:
+                        break
+                    if status == "failed":
+                        print(f"[INGEST] [NOTICE] PageIndex Cloud tree generation failed for doc '{doc_id}'.")
+                        break
+                except Exception as tree_err:
+                    print(f"[INGEST] [NOTICE] Tree poll error (will retry): {tree_err}")
+                time.sleep(poll_interval)
+                waited += poll_interval
+
+            if structure:
+                flat_structure = _flatten_pageindex_cloud_tree(structure, total_pages=len(pages_text))
+                print(f"[INGEST] [OK] Retrieved cloud-generated PageIndex tree with {len(flat_structure)} sections (from {len(structure)} top-level nodes) after {waited}s!")
+                return {
+                    "engine": "PageIndex Cloud API (Vision Engine)",
+                    "has_native_toc": False,
+                    "doc_id": doc_id,
+                    "structure": flat_structure
+                }
+
+            print(f"[INGEST] [NOTICE] PageIndex Cloud tree not ready after {max_wait_seconds}s - falling back to Groq Synthetic Engine so this document isn't left with no structure at all.")
         except Exception as e:
             print(f"[INGEST] [NOTICE] PageIndex Cloud API submission failed: {e}. Falling back to Groq Synthetic Engine.")
 
