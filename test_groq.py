@@ -57,7 +57,15 @@ from diagnostic import (
     compute_weak_prerequisites,
     MAX_QUESTIONS,
 )
-from planner import generate_study_plan
+from planner import generate_study_plan, mastery_band
+from lesson import (
+    recent_misconceptions_for_topic,
+    weakest_untested_prereq,
+    choose_delivery_mode,
+    generate_lesson,
+    grade_checkpoint,
+    MAX_RETEACH_ATTEMPTS,
+)
 
 # ---------------- API Keys Debug Verification ----------------
 def verify_and_log_api_keys():
@@ -1704,12 +1712,253 @@ def tutor_plan_generate():
             "file_id": file_id,
             "goal": goal,
             "study_plan": study_plan,
+            # Regenerating the plan changes the step sequence, so any
+            # lesson-delivery progress against the OLD sequence is reset -
+            # otherwise current_step_index could point at a different topic
+            # than the student was actually on.
+            "current_step_index": 0,
+            "remediation_queue": [],
+            "current_lesson": None,
             "updated_at": datetime.utcnow(),
         }},
         upsert=True
     )
 
     return jsonify(study_plan)
+
+
+@app.route('/api/tutor/lesson/next', methods=['POST'])
+@require_auth
+def tutor_lesson_next():
+    """
+    Phase 4, step 1 (Teach): returns the next lesson - either the next
+    planned topic, or a prerequisite remediation micro-lesson if one is
+    queued (see lesson.py). Safe to call repeatedly; it's idempotent until
+    /lesson/checkpoint is answered.
+    """
+    if not client:
+        return jsonify({"error": "Database connection is not available."}), 500
+
+    data = request.get_json(silent=True) or {}
+    file_id = (data.get('fileId') or '').strip()
+    if not file_id:
+        return jsonify({"error": "fileId is required"}), 400
+
+    profile = student_profiles_collection.find_one({"user_id": g.user_id, "file_id": file_id})
+    study_plan = (profile or {}).get("study_plan")
+    if not study_plan or not study_plan.get("steps"):
+        return jsonify({"error": "No study plan yet. Call /api/tutor/plan/generate first."}), 409
+
+    file_doc = resolve_file_by_id(file_id)
+    if not file_doc:
+        return jsonify({"error": "File not found"}), 404
+    topic_graph = get_or_build_topic_graph(file_doc)
+    topics_by_id = {t["id"]: t for t in (topic_graph or {}).get("topics", [])}
+    pages_text = file_doc.get("pages_text", [])
+
+    steps = study_plan["steps"]
+    step_index = profile.get("current_step_index", 0)
+    remediation_queue = profile.get("remediation_queue", [])
+    mastery = profile.get("mastery", {})
+
+    is_remediation = bool(remediation_queue)
+    if is_remediation:
+        topic_id = remediation_queue[0]
+    elif step_index < len(steps):
+        topic_id = steps[step_index]["topic_id"]
+    else:
+        return jsonify({"done": True, "message": "All planned topics completed."})
+
+    topic = topics_by_id.get(topic_id)
+    if not topic:
+        return jsonify({"error": f"Topic '{topic_id}' no longer exists in this document's topic graph."}), 409
+
+    # Idempotency: if the last lesson generated is still pending an answer
+    # (no checkpoint submitted yet - e.g. a page refresh), re-serve it
+    # rather than generating a new one and burning a reteach attempt/Groq
+    # call for a lesson the student never actually got to answer.
+    existing_lesson = profile.get("current_lesson")
+    if (
+        existing_lesson
+        and existing_lesson.get("topic_id") == topic_id
+        and existing_lesson.get("is_remediation") == is_remediation
+    ):
+        return jsonify({
+            "done": False,
+            "topic_id": topic_id,
+            "topic_title": topic["title"],
+            "is_remediation": is_remediation,
+            "delivery_mode": existing_lesson.get("delivery_mode"),
+            "mastery": mastery.get(topic_id, 0.0),
+            "band": mastery_band(mastery.get(topic_id, 0.0)),
+            "objective": existing_lesson["objective"],
+            "explanation": existing_lesson["explanation"],
+            "example": existing_lesson["example"],
+            "checkpoint_question": existing_lesson["checkpoint_question"],
+            "step_index": step_index,
+            "total_steps": len(steps),
+        })
+
+    planned_mode = next((s["delivery_mode"] for s in steps if s["topic_id"] == topic_id), "direct_explanation")
+    attempts = profile.get("explanation_attempts", {}).get(topic_id, [])
+    delivery_mode = choose_delivery_mode(planned_mode, attempts, is_remediation)
+
+    misconceptions = recent_misconceptions_for_topic(
+        profile.get("diagnostic_log", []), profile.get("lesson_log", []), topic_id
+    )
+
+    lesson_payload = generate_lesson(topic, pages_text, mastery, misconceptions, attempts, delivery_mode, is_remediation)
+    if not lesson_payload:
+        return jsonify({"error": "Failed to generate a lesson. Please try again."}), 502
+
+    current_lesson = {
+        "topic_id": topic_id,
+        "delivery_mode": delivery_mode,
+        "is_remediation": is_remediation,
+        **lesson_payload,
+    }
+
+    student_profiles_collection.update_one(
+        {"_id": profile["_id"]},
+        {
+            "$set": {"current_lesson": current_lesson, "updated_at": datetime.utcnow()},
+            "$push": {f"explanation_attempts.{topic_id}": delivery_mode},
+        }
+    )
+
+    return jsonify({
+        "done": False,
+        "topic_id": topic_id,
+        "topic_title": topic["title"],
+        "is_remediation": is_remediation,
+        "delivery_mode": delivery_mode,
+        "mastery": mastery.get(topic_id, 0.0),
+        "band": mastery_band(mastery.get(topic_id, 0.0)),
+        "objective": lesson_payload["objective"],
+        "explanation": lesson_payload["explanation"],
+        "example": lesson_payload["example"],
+        "checkpoint_question": lesson_payload["checkpoint_question"],
+        "step_index": step_index,
+        "total_steps": len(steps),
+    })
+
+
+@app.route('/api/tutor/lesson/checkpoint', methods=['POST'])
+@require_auth
+def tutor_lesson_checkpoint():
+    """
+    Phase 4, steps 2-3 (Check -> Adapt): grades the student's free-response
+    answer to the current lesson's checkpoint question, updates mastery
+    with the same fixed banded rule as the diagnostic (the LLM only judges
+    understood: true/false - it never invents the score), and decides what
+    happens next: advance, reteach with a new strategy, or insert a
+    prerequisite remediation - see lesson.py's module docstring.
+    """
+    if not client:
+        return jsonify({"error": "Database connection is not available."}), 500
+
+    data = request.get_json(silent=True) or {}
+    file_id = (data.get('fileId') or '').strip()
+    answer = (data.get('answer') or '').strip()
+    if not file_id or not answer:
+        return jsonify({"error": "fileId and answer are required"}), 400
+
+    profile = student_profiles_collection.find_one({"user_id": g.user_id, "file_id": file_id})
+    current_lesson = (profile or {}).get("current_lesson")
+    if not profile or not current_lesson:
+        return jsonify({"error": "No lesson in progress for this file. Call /api/tutor/lesson/next first."}), 409
+
+    file_doc = resolve_file_by_id(file_id)
+    if not file_doc:
+        return jsonify({"error": "File not found"}), 404
+    topic_graph = get_or_build_topic_graph(file_doc)
+    topics_by_id = {t["id"]: t for t in (topic_graph or {}).get("topics", [])}
+
+    topic_id = current_lesson["topic_id"]
+    topic = topics_by_id.get(topic_id)
+    if not topic:
+        return jsonify({"error": f"Topic '{topic_id}' no longer exists in this document's topic graph."}), 409
+
+    grade = grade_checkpoint(topic, current_lesson, answer)
+    if not grade:
+        return jsonify({"error": "Failed to grade the answer. Please try again."}), 502
+
+    mastery = profile.get("mastery", {})
+    mastery[topic_id] = update_mastery(mastery.get(topic_id, 0.0), grade["understood"])
+
+    lesson_log_entry = {
+        "topic_id": topic_id,
+        "delivery_mode": current_lesson.get("delivery_mode"),
+        "is_remediation": current_lesson.get("is_remediation", False),
+        "question": current_lesson.get("checkpoint_question"),
+        "answer": answer,
+        "understood": grade["understood"],
+        "misconception": grade["misconception"],
+        "timestamp": datetime.utcnow(),
+    }
+
+    steps = profile["study_plan"]["steps"]
+    step_index = profile.get("current_step_index", 0)
+    remediation_queue = profile.get("remediation_queue", [])
+    remediated_topics = profile.get("remediated_topics", [])
+    attempts = profile.get("explanation_attempts", {}).get(topic_id, [])
+
+    if current_lesson.get("is_remediation"):
+        # Single-pass remediation (MVP): whatever happened, drop it from
+        # the queue and return to (or continue) the original flow.
+        remediation_queue = remediation_queue[1:] if remediation_queue and remediation_queue[0] == topic_id else remediation_queue
+        next_action = "remediate_prerequisite" if remediation_queue else "advance"
+        reason = f"Reinforced prerequisite '{topic['title']}' before returning to your planned topic."
+    elif grade["understood"]:
+        step_index += 1
+        next_action = "advance"
+        reason = f"Checkpoint passed for '{topic['title']}'."
+    else:
+        weak_prereq_id = weakest_untested_prereq(topic, mastery, remediated_topics)
+        if weak_prereq_id:
+            remediation_queue = [weak_prereq_id] + remediation_queue
+            remediated_topics = remediated_topics + [weak_prereq_id]
+            weak_prereq_title = topics_by_id.get(weak_prereq_id, {}).get("title", weak_prereq_id)
+            next_action = "remediate_prerequisite"
+            reason = f"Struggling with '{topic['title']}' - reviewing prerequisite '{weak_prereq_title}' first."
+        elif len(attempts) < MAX_RETEACH_ATTEMPTS:
+            next_action = "reteach_different_strategy"
+            reason = f"Checkpoint not yet passed for '{topic['title']}' - trying a different approach next."
+        else:
+            step_index += 1
+            next_action = "advance_forced"
+            reason = f"Moving on from '{topic['title']}' after {len(attempts)} attempts - you can revisit it later."
+
+    done = step_index >= len(steps) and not remediation_queue
+
+    student_profiles_collection.update_one(
+        {"_id": profile["_id"]},
+        {
+            "$set": {
+                "mastery": mastery,
+                "current_step_index": step_index,
+                "remediation_queue": remediation_queue,
+                "remediated_topics": remediated_topics,
+                "current_lesson": None,
+                "updated_at": datetime.utcnow(),
+            },
+            "$push": {"lesson_log": lesson_log_entry},
+        }
+    )
+
+    return jsonify({
+        "understood": grade["understood"],
+        "feedback": grade["feedback"],
+        "misconception": grade["misconception"],
+        "topic_id": topic_id,
+        "topic_title": topic["title"],
+        "mastery": mastery[topic_id],
+        "next_action": next_action,
+        "reason": reason,
+        "done": done,
+        "step_index": step_index,
+        "total_steps": len(steps),
+    })
 
 
 # ===================================================================================================================================
