@@ -18,6 +18,7 @@ load_dotenv(find_dotenv())
 
 # Import S3 & Lipsync helpers
 from lipsync import upload_audio_to_s3, generate_lipsync_video
+from document_storage import ensure_local_copy
 
 # MongoDB Setup
 MONGO_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
@@ -101,12 +102,17 @@ def process_file():
         print("[PASSMAIN] [WARNING] No PDF document found in MongoDB to process.")
         return
 
-    pdf_path = os.path.normpath(file_doc.get("filePath", ""))
-    print(f"[PASSMAIN] Fetching document for summary: '{pdf_path}'")
-
-    if not os.path.exists(pdf_path):
-        print(f"[PASSMAIN] [ERROR] File does not exist at path: '{pdf_path}'")
+    # ensure_local_copy transparently re-downloads from S3 if the local
+    # path is missing (e.g. after a Render restart, or simply a file
+    # deleted from a previous local session) instead of just failing -
+    # this is the exact failure mode seen with a real upload
+    # ('ir_unit_1.pdf' no longer on disk).
+    try:
+        pdf_path = ensure_local_copy(file_doc, local_dir="uploads")
+    except FileNotFoundError as e:
+        print(f"[PASSMAIN] [ERROR] {e}")
         return
+    print(f"[PASSMAIN] Fetching document for summary: '{pdf_path}'")
 
     pdf_text = extract_text_from_pdf(pdf_path)
     if not pdf_text:
