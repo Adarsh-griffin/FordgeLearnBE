@@ -11,7 +11,7 @@ prompt-calling wrapper (they differ slightly, e.g. test_groq.py's
 import json
 import os
 import re
-from groq import Groq
+from groq import Groq, RateLimitError, AuthenticationError, PermissionDeniedError
 from dotenv import load_dotenv, find_dotenv
 
 load_dotenv(find_dotenv())
@@ -39,17 +39,38 @@ def rotate_key() -> None:
     print(f"[GROQ] Rotating to API key index: {_current_key_index}")
 
 
+def _key_label(index: int) -> str:
+    key = GROQ_KEYS[index]
+    return f"#{index + 1}/{len(GROQ_KEYS)} (...{key[-6:]})"
+
+
 def execute_with_retry(func, *args, **kwargs):
     """
     Call func(client, *args, **kwargs), rotating to the next Groq key and
     retrying on any exception, up to once per configured key.
+
+    Rate-limit/quota and auth failures get their own loud, distinct log
+    line (not just the generic one below) - the whole point being that a
+    "you need to swap this key" situation shouldn't look like any other
+    transient error buried in the rest of this app's console output.
     """
     max_retries = len(GROQ_KEYS)
     last_exception = None
     for attempt in range(max_retries):
+        key_index = _current_key_index
         try:
             client = get_client()
             return func(client, *args, **kwargs)
+        except RateLimitError as e:
+            print(f"[QUOTA LIMIT HIT] Groq key {_key_label(key_index)} hit its rate/usage limit (429). "
+                  f"Rotating to the next key - if EVERY key hits this, you need to add a fresh Groq API key to GROQ_API_KEY in .env.")
+            last_exception = e
+            rotate_key()
+        except (AuthenticationError, PermissionDeniedError) as e:
+            print(f"[INVALID KEY] Groq key {_key_label(key_index)} was rejected ({e.status_code}) - "
+                  f"it's likely invalid, expired, or revoked. Rotating - replace this key in .env.")
+            last_exception = e
+            rotate_key()
         except Exception as e:
             print(f"[GROQ] Attempt {attempt + 1} failed with key index {_current_key_index}: {e}")
             last_exception = e

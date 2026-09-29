@@ -248,7 +248,12 @@ def create_tavus_video(audio_url: str, video_name: str = "cloud-pipe-video", cal
         try:
             resp.raise_for_status()
         except Exception:
-            print("Tavus create failed:", resp.status_code, resp.text)
+            if resp.status_code == 429:
+                print(f"[QUOTA LIMIT HIT] Tavus key ending in '...{api_key[-6:] if api_key else '?'}' hit its rate/usage limit (429). Rotating - if this happens on every key, you need a fresh TAVUS_API_KEY.")
+            elif resp.status_code in (401, 403):
+                print(f"[INVALID KEY] Tavus key ending in '...{api_key[-6:] if api_key else '?'}' was rejected ({resp.status_code}) - it's likely invalid/expired. Replace TAVUS_API_KEY in .env.")
+            else:
+                print("Tavus create failed:", resp.status_code, resp.text)
             raise
         return resp.json()
 
@@ -270,12 +275,17 @@ def poll_video(video_id: str, interval: int = 5, timeout: int = 600):
             
             r = requests.get(VIDEOS_GET(vid), headers=headers, timeout=20)
             if r.status_code != 200:
-                print(f"Poll error (attempt {poll_count}, elapsed={elapsed:.0f}s): {r.status_code} {r.text}")
+                if r.status_code == 429:
+                    print(f"[QUOTA LIMIT HIT] Tavus key ending in '...{api_key[-6:] if api_key else '?'}' hit its rate/usage limit (429) while polling. Rotating - if this happens on every key, you need a fresh TAVUS_API_KEY.")
+                elif r.status_code in (401, 403):
+                    print(f"[INVALID KEY] Tavus key ending in '...{api_key[-6:] if api_key else '?'}' was rejected ({r.status_code}) while polling. Replace TAVUS_API_KEY in .env.")
+                else:
+                    print(f"Poll error (attempt {poll_count}, elapsed={elapsed:.0f}s): {r.status_code} {r.text}")
                 if r.status_code == 404:
                     raise FileNotFoundError(f"Video {vid} not found (404).")
-                # If 401/403, we might want to rotate. 
+                # If 401/403, we might want to rotate.
                 # Raising exception here triggers rotation in execute_tavus_with_retry
-                if r.status_code in (401, 403, 429): 
+                if r.status_code in (401, 403, 429):
                     r.raise_for_status()
             
             data = r.json()

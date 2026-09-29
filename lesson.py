@@ -89,9 +89,9 @@ def generate_lesson(
     misconception_lines = "\n".join(f"  - {m}" for m in misconceptions) or "  (none known)"
 
     strategy_notes = {
-        "worked_example": "Show one fully worked example step by step, then a second, lighter-guided example the student finishes conceptually themselves.",
-        "socratic": "Do NOT give the answer directly. Ask a leading question first that targets the known misconception above, before any explanation.",
-        "direct_explanation": "Give a clear, concise explanation with one illustrative example.",
+        "worked_example": "Show one fully worked example step by step, then a second, lighter-guided example the student finishes conceptually themselves. Explain the reasoning behind each step, don't just show the mechanics.",
+        "socratic": "Do NOT give the answer directly. Ask a leading question first that targets the known misconception above, then walk through the full reasoning once the setup is established - still cover the concept in depth, just Socratically.",
+        "direct_explanation": "Give a thorough, in-depth explanation: what the concept is, how it works or why it's true, how it connects to what the student already knows, and at least one illustrative example - not a short summary.",
         "review": "This student already knows this - a brief 2-3 sentence refresher only, do not re-teach it as if new.",
     }
 
@@ -121,16 +121,23 @@ Teaching strategy to use: {delivery_mode}
 {context_note}
 {attempts_note}
 
-Write a short lesson. Return ONLY a JSON object of this exact shape, with
-no markdown code fences and no extra commentary:
+Write a full, in-depth lesson on this topic - unless the strategy above is
+"review", the explanation must be several substantial paragraphs that
+genuinely teach the whole concept (the core idea, how/why it works, how it
+connects to related ideas, common pitfalls), not a short intro or a
+one-paragraph summary. A student reading only this should come away able
+to actually use the concept, not just recognize its name.
+
+Return ONLY a JSON object of this exact shape, with no markdown code
+fences and no extra commentary:
 {{
   "objective": "one sentence: what the student will understand after this",
-  "explanation": "the main teaching content, following the strategy above",
-  "example": "one concrete example or worked problem illustrating the idea",
+  "explanation": "the main teaching content, following the strategy above - thorough and complete, not brief",
+  "example": "one concrete example or worked problem illustrating the idea, explained in full, not just stated",
   "checkpoint_question": "one question to check real understanding - should require genuine understanding to answer, not just recall of a definition"
 }}
 """
-    result = groq_generate_json(prompt, max_tokens=1400, temperature=0.5)
+    result = groq_generate_json(prompt, max_tokens=2200, temperature=0.5)
     if not isinstance(result, dict):
         return None
     required = ("objective", "explanation", "checkpoint_question")

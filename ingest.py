@@ -1,3 +1,4 @@
+
 import os
 import sys
 import json
@@ -148,8 +149,16 @@ def parse_with_pageindex_api_or_synthetic(pages_text, file_path):
         try:
             print(f"[INGEST] Submitting document to PageIndex Cloud API with key ending in '...{PAGEINDEX_API_KEY[-6:]}'...")
             from pageindex import PageIndexClient
+            from pageindex.errors import PageIndexAPIError
             pi_client = PageIndexClient(api_key=PAGEINDEX_API_KEY)
-            submit_res = pi_client.submit_document(file_path)
+            try:
+                submit_res = pi_client.submit_document(file_path)
+            except PageIndexAPIError as e:
+                if e.status_code == 429:
+                    print(f"[QUOTA LIMIT HIT] PageIndex Cloud key '...{PAGEINDEX_API_KEY[-6:]}' hit its rate/usage limit (429). You need a fresh PAGEINDEX_API_KEY - falling back to Groq Synthetic Engine for now.")
+                elif e.status_code in (401, 403):
+                    print(f"[INVALID KEY] PageIndex Cloud key '...{PAGEINDEX_API_KEY[-6:]}' was rejected ({e.status_code}) - it's likely invalid/expired. Replace PAGEINDEX_API_KEY in .env - falling back to Groq Synthetic Engine for now.")
+                raise
             doc_id = submit_res.get("doc_id")
             print(f"[INGEST] [OK] Successfully registered document on PageIndex Cloud dashboard! Doc ID: '{doc_id}'")
 
@@ -175,6 +184,13 @@ def parse_with_pageindex_api_or_synthetic(pages_text, file_path):
                     if status == "failed":
                         print(f"[INGEST] [NOTICE] PageIndex Cloud tree generation failed for doc '{doc_id}'.")
                         break
+                except PageIndexAPIError as tree_err:
+                    if tree_err.status_code == 429:
+                        print(f"[QUOTA LIMIT HIT] PageIndex Cloud key '...{PAGEINDEX_API_KEY[-6:]}' hit its rate/usage limit (429) while polling for the tree. You need a fresh PAGEINDEX_API_KEY.")
+                    elif tree_err.status_code in (401, 403):
+                        print(f"[INVALID KEY] PageIndex Cloud key '...{PAGEINDEX_API_KEY[-6:]}' was rejected ({tree_err.status_code}) while polling. Replace PAGEINDEX_API_KEY in .env.")
+                    else:
+                        print(f"[INGEST] [NOTICE] Tree poll error (will retry): {tree_err}")
                 except Exception as tree_err:
                     print(f"[INGEST] [NOTICE] Tree poll error (will retry): {tree_err}")
                 time.sleep(poll_interval)

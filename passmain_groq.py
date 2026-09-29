@@ -3,6 +3,8 @@ import sys
 import json
 import time
 from datetime import datetime
+from bson import ObjectId
+from bson.errors import InvalidId
 from pymongo import MongoClient
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv, find_dotenv
@@ -55,36 +57,43 @@ def split_text_into_chunks(text, chunk_size=3000, chunk_overlap=200):
         start += (chunk_size - chunk_overlap)
     return chunks
 
-def get_latest_pdf_doc():
-    """Fetch the latest uploaded PDF document from MongoDB."""
+def get_target_doc(target_id: str | None):
+    """
+    Resolves the document THIS run should process. test_groq.py's
+    /api/upload always passes the exact Mongo _id as argv[1] (see the
+    comment at its subprocess.Popen call) - "most recently uploaded" is
+    only a fallback for a manual/no-argument run. Blindly using "most
+    recent" as the primary lookup used to mean a re-upload of an
+    already-existing file (whose uploadDate never changes) could grab a
+    completely different, unrelated document's summary, while the file
+    that was actually just uploaded sat stuck "processing" forever - a
+    real, observed failure, not a hypothetical one.
+    """
+    if target_id:
+        try:
+            doc = collection.find_one({"_id": ObjectId(target_id)})
+            if doc:
+                return doc
+            print(f"[PASSMAIN] [WARNING] No document found for id '{target_id}' - falling back to most recent upload.")
+        except InvalidId:
+            print(f"[PASSMAIN] [WARNING] '{target_id}' isn't a valid document id - falling back to most recent upload.")
     return collection.find_one({}, sort=[("uploadDate", -1)])
 
-def save_explanation_to_mongo(file_path, explanation):
-    """Update MongoDB document with generated explanation."""
+def save_explanation_to_mongo(doc_id, explanation):
+    """Update MongoDB document with generated explanation, by its exact _id - no string-matching guesswork."""
     result = collection.update_one(
-        {"filePath": file_path},
+        {"_id": doc_id},
         {"$set": {"explanation": explanation, "status": "completed"}}
     )
     if result.modified_count > 0:
-        print(f"[PASSMAIN] [OK] Explanation saved successfully for {file_path}")
+        print(f"[PASSMAIN] [OK] Explanation saved successfully for document _id={doc_id}")
     else:
-        # Fallback match by originalName if filePath differs
-        base_name = os.path.basename(file_path)
-        result2 = collection.update_one(
-            {"originalName": base_name},
-            {"$set": {"explanation": explanation, "status": "completed"}}
-        )
-        print(f"[PASSMAIN] [OK] Fallback update by originalName '{base_name}': {result2.modified_count} doc modified.")
+        print(f"[PASSMAIN] [WARNING] No document matched _id={doc_id} when saving the explanation (deleted since?).")
 
 def process_file():
     print("\n[PASSMAIN] =========== [START] Processing Document Summary & Explanations ===========")
-    # Brief pause to allow ingest.py to complete writing metadata & page_index to MongoDB
-    time.sleep(2)
-    
-    file_doc = get_latest_pdf_doc()
-    if not file_doc:
-        print("[PASSMAIN] [WARNING] No PDF document found in MongoDB to process.")
-        return
+
+    target_id = sys.argv[1] if len(sys.argv) > 1 else None
 
     # Uses the page text ingest.py already extracted and stored in Mongo
     # (files.pages_text), instead of re-opening the original PDF file at
@@ -93,13 +102,34 @@ def process_file():
     # no longer on disk) - PDFs aren't kept in S3 (only TTS audio/video are,
     # per this app's storage design), so local disk is genuinely just a
     # same-request scratch copy; nothing should depend on it existing later.
-    # Every page's text is already durable in MongoDB by the time this runs.
+    #
+    # pages_text is written by ingest.py, which can easily take longer than
+    # a couple of seconds (PageIndex Cloud polling, or a topic-mode Groq
+    # curriculum-generation call) - a single fixed sleep(2)-then-give-up
+    # used to fail immediately and permanently in that case (confirmed: a
+    # topic-mode upload got stuck "processing" forever from exactly this).
+    # Poll instead, same pattern as ingest.py's own PageIndex Cloud wait.
+    max_wait_seconds = 90
+    poll_interval = 3
+    waited = 0
+    file_doc = None
+    while waited <= max_wait_seconds:
+        file_doc = get_target_doc(target_id)
+        if file_doc and file_doc.get("pages_text"):
+            break
+        time.sleep(poll_interval)
+        waited += poll_interval
+
+    if not file_doc:
+        print("[PASSMAIN] [WARNING] No document found in MongoDB to process.")
+        return
+
     pdf_path = file_doc.get("filePath", "")
     pages_text = file_doc.get("pages_text") or []
     if not pages_text:
-        print(f"[PASSMAIN] [ERROR] No pages_text found in MongoDB for '{pdf_path}' - ingest.py may not have finished yet, or failed.")
+        print(f"[PASSMAIN] [ERROR] No pages_text appeared in MongoDB for '{pdf_path}' after waiting {max_wait_seconds}s - ingestion likely failed.")
         return
-    print(f"[PASSMAIN] Using {len(pages_text)} page(s) of text already stored in MongoDB for '{pdf_path}'")
+    print(f"[PASSMAIN] Using {len(pages_text)} page(s) of text already stored in MongoDB for '{pdf_path}' (waited {waited}s)")
 
     pdf_text = "\n".join(p.get("text", "") for p in pages_text)
     if not pdf_text.strip():
@@ -134,8 +164,8 @@ def process_file():
         output.append(parsed_output)
         prev_summary = explanation_text[-500:]
 
-    # Save explanation array to MongoDB
-    save_explanation_to_mongo(pdf_path, output)
+    # Save explanation array to MongoDB, against this exact document's _id
+    save_explanation_to_mongo(file_doc["_id"], output)
     print("[PASSMAIN] [OK] Document explanation processing completed and saved to MongoDB!\n")
 
 if __name__ == '__main__':

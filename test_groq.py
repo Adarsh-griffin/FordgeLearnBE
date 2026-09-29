@@ -327,9 +327,15 @@ def upload_file():
             print(f"Starting subprocess for ingest: {filepath}")
             subprocess.Popen([sys.executable, 'ingest.py', filepath])
 
-            # Run pass2main.py
+            # Run pass2main.py - passes the exact document _id (mirroring
+            # how ingest.py already receives its file path above), so
+            # passmain_groq.py processes THIS document rather than
+            # guessing "whichever one has the newest uploadDate" (a
+            # re-upload of an already-existing file never updates that
+            # timestamp, so that guess could - and did - grab a
+            # completely different, unrelated document).
             print(f"Starting subprocess for passmain_groq")
-            subprocess.Popen([sys.executable, 'passmain_groq.py'])
+            subprocess.Popen([sys.executable, 'passmain_groq.py', file_id])
 
         except Exception as e:
             print(f"Error starting subprocess: {e}")
