@@ -21,7 +21,6 @@ from pathlib import Path
 # from faster_whisper import WhisperModel  # Local STT disabled; using Groq hosted Whisper
 from dotenv import load_dotenv, find_dotenv
 from lipsync import generate_lipsync_video, upload_audio_to_s3
-from document_storage import upload_pdf_bytes
 TTS_OUTPUT_FOLDER = "path/to/your/static/collections"
 
 
@@ -295,27 +294,21 @@ def upload_file():
     if file:
         filename = secure_filename(file.filename)
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file_bytes = file.read()
-        file.seek(0)
         file.save(filepath)
 
-        # Durable copy: local disk is ephemeral on Render (wiped on every
-        # dyno restart/redeploy) - filePath above only ever works for the
-        # lifetime of THIS process. S3 is what survives; local disk is now
-        # just a same-session convenience cache (see document_storage.py).
-        s3_info = None
-        try:
-            s3_info = upload_pdf_bytes(file_bytes, filename)
-        except Exception as e:
-            print(f"[UPLOAD] [WARNING] Failed to upload PDF to S3 - this document will NOT survive a server restart until re-uploaded: {e}")
-
+        # PDFs are never stored in S3 - only TTS audio/video are (see
+        # lipsync.py). By the time ingest.py finishes, this file's full
+        # text (files.pages_text) and structure (files.page_index) are
+        # already durable in MongoDB; nothing downstream should depend on
+        # this local disk copy still existing afterward. See
+        # passmain_groq.py's process_file() for the specific bug this
+        # replaced (it used to re-open this local path long after upload
+        # and fail once the file was gone).
         if client:
             existing = files_collection.find_one({"originalName": file.filename})
             if existing:
                 print(f"File '{file.filename}' already exists in DB. Skipping metadata insert.")
                 file_id = str(existing["_id"])
-                if s3_info:
-                    files_collection.update_one({"_id": existing["_id"]}, {"$set": {"s3_key": s3_info["key"], "s3_url": s3_info["url"]}})
             else:
                 metadata = {
                     "originalName": file.filename,
@@ -324,9 +317,6 @@ def upload_file():
                     "fileSize": os.path.getsize(filepath),
                     "uploadDate": datetime.utcnow()
                 }
-                if s3_info:
-                    metadata["s3_key"] = s3_info["key"]
-                    metadata["s3_url"] = s3_info["url"]
                 inserted = files_collection.insert_one(metadata)
                 file_id = str(inserted.inserted_id)
         else:

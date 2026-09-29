@@ -2,7 +2,6 @@ import os
 import sys
 import json
 import time
-import PyPDF2
 from datetime import datetime
 from pymongo import MongoClient
 from werkzeug.utils import secure_filename
@@ -16,9 +15,9 @@ from groq_client import get_client as get_current_groq_client, rotate_key, execu
 # Load environment
 load_dotenv(find_dotenv())
 
-# Import S3 & Lipsync helpers
+# Import S3 & Lipsync helpers - audio/video only; PDFs are never stored in
+# S3 (see the note above process_file() for why).
 from lipsync import upload_audio_to_s3, generate_lipsync_video
-from document_storage import ensure_local_copy
 
 # MongoDB Setup
 MONGO_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
@@ -44,21 +43,6 @@ def groq_generate(prompt, max_tokens=700, temperature=0.7):
     except Exception as e:
         print(f"[PASSMAIN] Error generating response after retries: {e}")
         return None
-
-def extract_text_from_pdf(pdf_path):
-    """Extracts all text from a PDF file."""
-    text = ""
-    try:
-        with open(pdf_path, "rb") as f:
-            reader = PyPDF2.PdfReader(f)
-            for page in reader.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-    except Exception as e:
-        print(f"[PASSMAIN] Error reading PDF {pdf_path}: {e}")
-        return None
-    return text
 
 def split_text_into_chunks(text, chunk_size=3000, chunk_overlap=200):
     """Simple character-level chunk splitter with overlap (No heavy langchain dependency)."""
@@ -102,21 +86,24 @@ def process_file():
         print("[PASSMAIN] [WARNING] No PDF document found in MongoDB to process.")
         return
 
-    # ensure_local_copy transparently re-downloads from S3 if the local
-    # path is missing (e.g. after a Render restart, or simply a file
-    # deleted from a previous local session) instead of just failing -
-    # this is the exact failure mode seen with a real upload
-    # ('ir_unit_1.pdf' no longer on disk).
-    try:
-        pdf_path = ensure_local_copy(file_doc, local_dir="uploads")
-    except FileNotFoundError as e:
-        print(f"[PASSMAIN] [ERROR] {e}")
+    # Uses the page text ingest.py already extracted and stored in Mongo
+    # (files.pages_text), instead of re-opening the original PDF file at
+    # all. This used to independently re-read the PDF from its local disk
+    # path, which is exactly what failed for a real upload ('ir_unit_1.pdf'
+    # no longer on disk) - PDFs aren't kept in S3 (only TTS audio/video are,
+    # per this app's storage design), so local disk is genuinely just a
+    # same-request scratch copy; nothing should depend on it existing later.
+    # Every page's text is already durable in MongoDB by the time this runs.
+    pdf_path = file_doc.get("filePath", "")
+    pages_text = file_doc.get("pages_text") or []
+    if not pages_text:
+        print(f"[PASSMAIN] [ERROR] No pages_text found in MongoDB for '{pdf_path}' - ingest.py may not have finished yet, or failed.")
         return
-    print(f"[PASSMAIN] Fetching document for summary: '{pdf_path}'")
+    print(f"[PASSMAIN] Using {len(pages_text)} page(s) of text already stored in MongoDB for '{pdf_path}'")
 
-    pdf_text = extract_text_from_pdf(pdf_path)
-    if not pdf_text:
-        print("[PASSMAIN] [ERROR] Could not extract text from PDF.")
+    pdf_text = "\n".join(p.get("text", "") for p in pages_text)
+    if not pdf_text.strip():
+        print("[PASSMAIN] [ERROR] Stored pages_text was empty for this document.")
         return
 
     chunks = split_text_into_chunks(pdf_text, chunk_size=3000, chunk_overlap=200)
