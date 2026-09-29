@@ -158,5 +158,21 @@ def groq_generate_json(prompt: str, max_tokens: int = 900, temperature: float = 
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError as e:
+        # Reproducibly triggered by lesson content containing LaTeX (the
+        # lesson/example fields are meant to include math, rendered via
+        # KaTeX on the frontend) - "\Delta", "\times" etc. are valid LaTeX
+        # but NOT valid JSON string escapes, so the model emitting them
+        # un-doubled inside a JSON string breaks json.loads with "Invalid
+        # \escape" every time (confirmed: consistently failed on RAG lesson
+        # generation before this fix, 100% of attempts). Escaping any
+        # backslash not already forming a legal JSON escape sequence and
+        # retrying recovers the exact same content without corrupting
+        # genuinely valid escapes (\n, \", \\, \uXXXX, ...).
+        repaired = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', cleaned)
+        if repaired != cleaned:
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError:
+                pass
         print(f"[GROQ] groq_generate_json: failed to parse JSON: {e}\nRaw: {cleaned[:300]}")
         return None

@@ -1395,6 +1395,49 @@ def tutor_ping():
     return jsonify({"ok": True, "user_id": g.user_id})
 
 
+@app.route('/api/tutor/progress', methods=['GET'])
+@require_auth
+def tutor_progress():
+    """
+    Lets the AI Tutor tab resume exactly where a student left off instead
+    of restarting at onboarding every time the tab remounts (switching to
+    another tab and back, or reopening the site later) - every diagnostic
+    answer, generated plan, and in-flight lesson is already persisted on
+    student_profiles by the routes below; this just reads that back
+    without mutating anything, so the frontend can jump straight to
+    "roadmap" or "lesson" instead of onboarding when there's something to
+    resume. Used identically by the desktop and mobile AI Tutor UIs, since
+    both share the same TutorTab component.
+    """
+    if not client:
+        return jsonify({"error": "Database connection is not available."}), 500
+
+    file_id = (request.args.get('fileId') or '').strip()
+    if not file_id:
+        return jsonify({"error": "fileId is required"}), 400
+
+    profile = student_profiles_collection.find_one({"user_id": g.user_id, "file_id": file_id})
+    if not profile:
+        return jsonify({"stage": "onboarding"})
+
+    study_plan = profile.get("study_plan")
+    if study_plan and study_plan.get("steps"):
+        has_started_lessons = bool(profile.get("current_lesson")) or profile.get("current_step_index", 0) > 0
+        return jsonify({
+            "stage": "lesson" if has_started_lessons else "roadmap",
+            "goal": profile.get("goal"),
+            "availableMinutes": study_plan.get("available_minutes"),
+            "studyPlan": study_plan,
+        })
+
+    # A diagnostic mid-question isn't resumed to its exact question - it's
+    # quick (max 7 questions) and DiagnosticQuiz always calls /start fresh
+    # on mount anyway, which would restart it regardless. Only the much
+    # more expensive-to-lose state (a generated plan/lesson progress) is
+    # actually resumed here.
+    return jsonify({"stage": "onboarding", "goal": profile.get("goal")})
+
+
 def get_or_build_topic_graph(file_doc):
     """
     Shared by /api/tutor/topics and the diagnostic routes below: returns
