@@ -1420,6 +1420,32 @@ def get_or_build_topic_graph(file_doc):
     return topic_graph
 
 
+def get_or_fetch_topic_images(file_doc, topic):
+    """
+    Cached per-DOCUMENT, per-topic (not per-student - every student
+    studying this document's "RAG Architecture" topic sees the same
+    illustrative images), stored on topic_graph.topics.$.image_urls
+    alongside the topic itself. Serper is a paid/rate-limited API, so this
+    guarantees at most one Serper call per topic ever, regardless of how
+    many students reach it.
+    """
+    cached = topic.get("image_urls")
+    if cached is not None:
+        print(f"[TOPIC-IMAGES] [CACHE HIT] Using {len(cached)} cached image(s) for topic '{topic.get('title', '')}' - no Serper call made.")
+        return cached
+
+    from topic_images import fetch_topic_images
+    urls = fetch_topic_images(topic.get("title", ""))
+
+    files_collection.update_one(
+        {"_id": file_doc["_id"], "topic_graph.topics.id": topic["id"]},
+        {"$set": {"topic_graph.topics.$.image_urls": urls}}
+    )
+    print(f"[TOPIC-IMAGES] Cached {len(urls)} image(s) for topic '{topic.get('title', '')}' on file _id={file_doc['_id']}.")
+    topic["image_urls"] = urls
+    return urls
+
+
 @app.route('/api/tutor/topics', methods=['GET'])
 @require_auth
 def tutor_topics():
@@ -1816,6 +1842,7 @@ def tutor_lesson_next():
             "explanation": existing_lesson["explanation"],
             "example": existing_lesson["example"],
             "checkpoint_question": existing_lesson["checkpoint_question"],
+            "images": get_or_fetch_topic_images(file_doc, topic),
             "step_index": step_index,
             "total_steps": len(steps),
         })
@@ -1859,6 +1886,7 @@ def tutor_lesson_next():
         "explanation": lesson_payload["explanation"],
         "example": lesson_payload["example"],
         "checkpoint_question": lesson_payload["checkpoint_question"],
+        "images": get_or_fetch_topic_images(file_doc, topic),
         "step_index": step_index,
         "total_steps": len(steps),
     })

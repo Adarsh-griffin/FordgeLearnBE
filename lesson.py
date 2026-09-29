@@ -121,20 +121,28 @@ Teaching strategy to use: {delivery_mode}
 {context_note}
 {attempts_note}
 
-Write a full, in-depth lesson on this topic - unless the strategy above is
-"review", the explanation must be several substantial paragraphs that
-genuinely teach the whole concept (the core idea, how/why it works, how it
-connects to related ideas, common pitfalls), not a short intro or a
-one-paragraph summary. A student reading only this should come away able
-to actually use the concept, not just recognize its name.
+Write a full, in-depth interactive lesson on this topic formatted into distinct visual learning blocks:
 
-Return ONLY a JSON object of this exact shape, with no markdown code
-fences and no extra commentary:
+FORMAT RULES:
+1. Do NOT write monochrome walls of text. Break the lesson into clear numbered sections (e.g. ### 01 Title, ### 02 Title).
+2. Include W3Schools-style callout blocks:
+   - > 💡 DEFINITION: Clear formal concept definition
+   - > 🧑‍🏫 IN SIMPLE WORDS: Friendly intuition / simple breakdown
+   - > 📌 IMPORTANT: Key takeaways or rules to remember
+   - > ⚠️ COMMON MISTAKE: Pitfalls or common confusion points
+   - > 🔬 WHY THIS WORKS: Deeper underlying reasoning
+3. Present concept flows clearly using arrow notation (e.g. Position → Velocity → Acceleration).
+4. Present key formulas in math blocks $$ ... $$ or code blocks, immediately followed by a Symbol breakdown table:
+   | Symbol | Meaning | Unit |
+5. In the "example" field, provide a visual step-by-step worked example using clear labels:
+   Given: ..., Find: ..., Step 1: ..., Step 2: ..., Answer: ...
+
+Return ONLY a JSON object of this exact shape, with no markdown code fences and no extra commentary:
 {{
   "objective": "one sentence: what the student will understand after this",
-  "explanation": "the main teaching content, following the strategy above - thorough and complete, not brief",
-  "example": "one concrete example or worked problem illustrating the idea, explained in full, not just stated",
-  "checkpoint_question": "one question to check real understanding - should require genuine understanding to answer, not just recall of a definition"
+  "explanation": "the main teaching content, following the strategy and visual block format rules above - thorough and complete",
+  "example": "one concrete worked example with Given, Find, Step 1, Step 2, and Answer labels",
+  "checkpoint_question": "one question to check real understanding with choices A), B), C), D) if applicable"
 }}
 """
     result = groq_generate_json(prompt, max_tokens=2200, temperature=0.5)
