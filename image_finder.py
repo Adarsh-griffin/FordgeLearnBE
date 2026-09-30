@@ -18,7 +18,7 @@ SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 SERPER_URL = "https://google.serper.dev/images"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://jamdadeaditya05_db_user:Aditya6768@cluster0.2cdq0nw.mongodb.net/")
-DB_NAME = "LearnFodge"
+DB_NAME = "LearnFordge"
 COLLECTION_NAME = "files"
 
 # AWS Config

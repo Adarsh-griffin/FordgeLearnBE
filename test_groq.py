@@ -21,6 +21,7 @@ from pathlib import Path
 # from faster_whisper import WhisperModel  # Local STT disabled; using Groq hosted Whisper
 from dotenv import load_dotenv, find_dotenv
 from lipsync import generate_lipsync_video, upload_audio_to_s3
+from gcp_tts import synthesize_speech as gcp_synthesize_speech, GOOGLE_TTS_VOICE_NAME
 TTS_OUTPUT_FOLDER = "path/to/your/static/collections"
 
 
@@ -537,17 +538,65 @@ def ask_question():
 def get_latest_pdf_doc():
     return files_collection.find_one({}, sort=[("uploadDate", -1)])
 
+def get_or_fetch_document_images(file_doc):
+    """
+    Same idea as the AI Tutor lesson screen's get_or_fetch_topic_images, but
+    at document level for the Learning Hub's summary page: cached once on
+    files.images so Serper is only ever called once per document, no matter
+    how many times the summary is viewed/refreshed.
+
+    Replaces the frontend's old behavior of GUESSING a Serper/S3 image URL
+    pattern client-side from the filename (`{bucket}/learning-images/{name}/
+    {name}-learning-image-{n}.png`) - those files never actually existed at
+    those URLs (the pipeline that would have uploaded them, image_finder.py,
+    is dead code that's never invoked anywhere), so every summary image was
+    silently broken. This fetches and stores REAL image URLs instead.
+    """
+    cached = file_doc.get("images")
+    if cached is not None:
+        return cached
+
+    title = file_doc.get("originalName") or ""
+    query = os.path.splitext(title)[0].replace('_', ' ').replace('-', ' ').strip()
+    if not query:
+        exp = file_doc.get("explanation")
+        first_text = ""
+        if isinstance(exp, list) and exp and isinstance(exp[0], dict):
+            first_text = exp[0].get("explanation", "")
+        query = first_text[:60]
+
+    from topic_images import fetch_topic_images
+    urls = fetch_topic_images(query, limit=4) if query else []
+
+    files_collection.update_one({"_id": file_doc["_id"]}, {"$set": {"images": urls}})
+    return urls
+
+
 @app.route("/api/get_text")
 def get_text():
-    """Return the latest uploaded text from MongoDB."""
-    file_doc = files_collection.find_one({}, sort=[("uploadDate", -1)])  # latest document
+    """
+    Return the summarized text for one document - identified by `fileName`
+    (matches how /api/qa, /api/qa-voice, /api/qa-tts already resolve which
+    document to use), falling back to the most recent upload only if no
+    fileName is given at all. This used to ALWAYS grab the most recent
+    upload regardless of which document the Learning Hub's file selector
+    had chosen - confirmed broken: switching documents there never changed
+    what this returned, and a freshly-selected-but-not-yet-summarized
+    upload just looked permanently broken instead of "still processing."
+    """
+    file_name = (request.args.get('fileName') or '').strip() or None
+    file_doc, _ = resolve_file_context(file_name)
 
     if not file_doc:
-        return jsonify({"script_text": "No content available."})
+        return jsonify({"script_text": "No content available.", "status": "not_found"})
 
     exp = file_doc.get("explanation")
     if not exp:
-        return jsonify({"script_text": "No content available."})
+        return jsonify({
+            "script_text": "",
+            "status": "processing",
+            "fileName": file_doc.get("originalName"),
+        })
 
     texts = []
     if isinstance(exp, list):
@@ -562,12 +611,11 @@ def get_text():
         texts.append(str(exp).strip())
 
     combined_text = " ".join([t for t in texts if t])
-    
-    # Extract images (default to empty list)
-    images = file_doc.get("images", [])
-    
+    images = get_or_fetch_document_images(file_doc)
+
     return jsonify({
         "script_text": combined_text or "No content available.",
+        "status": "completed",
         "images": images,
         "fileName": file_doc.get("originalName") # e.g. jesc110.pdf
     })
@@ -575,8 +623,16 @@ def get_text():
 
 @app.route("/api/get_links")
 def get_links():
-    """Return the latest uploaded links from MongoDB."""
-    file_doc = files_collection.find_one({}, sort=[("uploadDate", -1)])  # latest document
+    """
+    Return the reference links for one document - same `fileName`
+    resolution as /api/get_text (see its docstring for why "always the
+    latest upload" was broken). Links are now real search results (see
+    passmain_groq.py's process_file -> reference_links.fetch_reference_links)
+    instead of the same hardcoded Wikipedia search URL returned for every
+    document ever.
+    """
+    file_name = (request.args.get('fileName') or '').strip() or None
+    file_doc, _ = resolve_file_context(file_name)
 
     if not file_doc:
         return jsonify({"links": []})
@@ -586,15 +642,22 @@ def get_links():
         return jsonify({"links": []})
 
     all_links = []
+    seen_urls = set()
     def push_links(val):
         if not val:
             return
-        if isinstance(val, list):
-            for x in val:
-                if isinstance(x, str):
-                    all_links.append(x)
-        elif isinstance(val, str):
-            all_links.append(val)
+        items = val if isinstance(val, list) else [val]
+        for x in items:
+            if isinstance(x, dict) and x.get("url") and x["url"] not in seen_urls:
+                seen_urls.add(x["url"])
+                all_links.append({
+                    "title": x.get("title") or x["url"],
+                    "url": x["url"],
+                    "description": x.get("description"),
+                })
+            elif isinstance(x, str) and x not in seen_urls:
+                seen_urls.add(x)
+                all_links.append(x)
 
     if isinstance(exp, list):
         for item in exp:
@@ -614,14 +677,14 @@ def get_links():
 
 @app.route('/api/learning-tts', methods=['POST'])
 def learning_tts():
-    """Synthesize speech for given text using Groq/PlayAI and store audio in MongoDB GridFS."""
+    """Synthesize speech for given text using GCP Text-to-Speech and store audio in MongoDB GridFS."""
     try:
         data = request.get_json(force=True)
         text = (data or {}).get('text', '').strip()
-        voice = (data or {}).get('voice', 'Nia-PlayAI')
-        model = (data or {}).get('model', 'playai-tts')
+        voice = (data or {}).get('voice', GOOGLE_TTS_VOICE_NAME)
+        model = "gcp-tts"
         file_name_req = (data or {}).get('fileName') or (data or {}).get('file_name')
-        print(f"[PLAYAI-TTS] Incoming request: fileName={file_name_req}, text_len={len(text)}")
+        print(f"[GCP-TTS] Incoming request: fileName={file_name_req}, text_len={len(text)}")
         
         # Get file document early so we can reuse it
         file_doc = None
@@ -631,10 +694,10 @@ def learning_tts():
             if not file_doc:
                 file_doc = files_collection.find_one({}, sort=[("uploadDate", -1)])
             if file_doc:
-                print(f"[PLAYAI-TTS] Using file_doc originalName={file_doc.get('originalName')}")
+                print(f"[GCP-TTS] Using file_doc originalName={file_doc.get('originalName')}")
         except Exception:
             file_doc = None
-            print("[PLAYAI-TTS] Warning: unable to fetch file_doc; proceeding without DB context.")
+            print("[GCP-TTS] Warning: unable to fetch file_doc; proceeding without DB context.")
 
         timestamp = int(datetime.utcnow().timestamp())
         folder_seed_value = None
@@ -664,77 +727,26 @@ def learning_tts():
                 if not text:
                     return jsonify({"error": "No text found in explanation."}), 400
                     
-                print(f"[PLAYAI-TTS] Fetched summary text from DB (length: {len(text)} chars)")
+                print(f"[GCP-TTS] Fetched summary text from DB (length: {len(text)} chars)")
             except Exception as e:
                 import traceback
                 traceback.print_exc()
                 return jsonify({"error": f"No text provided and database is inaccessible: {str(e)}"}), 400
         else:
-            print(f"[PLAYAI-TTS] Using provided text length={len(text)}")
-
-        def _do_tts(client, m, v, txt):
-            return client.audio.speech.create(
-                model=m,
-                voice=v,
-                response_format="wav",
-                input=txt,
-            )
+            print(f"[GCP-TTS] Using provided text length={len(text)}")
 
         try:
-            print(f"[PLAYAI-TTS] Synthesizing for model: {model}, voice: {voice}, format: wav, text_len={len(text)}")
-            response = execute_with_retry(_do_tts, model, voice, text)
+            print(f"[GCP-TTS] Synthesizing with voice: {voice}, text_len={len(text)}")
+            audio_bytes = gcp_synthesize_speech(text, voice)
         except Exception as e:
-            return jsonify({"error": "Groq/PlayAI TTS request failed after retries", "details": str(e)}), 502
+            print(f"[GCP-TTS] ERROR: synthesis failed: {e}")
+            return jsonify({"error": "GCP TTS request failed", "details": str(e)}), 502
 
-        # Robustly obtain audio bytes from response. The Groq client may expose
-        # different interfaces depending on version: prefer iter_bytes(), then
-        # try .content, then fall back to streaming to a temp file.
-        audio_bytes = b""
-        try:
-            if hasattr(response, 'iter_bytes'):
-                print('[PLAYAI-TTS] Using response.iter_bytes() to collect audio bytes')
-                for chunk in response.iter_bytes():
-                    audio_bytes += chunk
-            elif hasattr(response, 'content'):
-                print('[PLAYAI-TTS] Using response.content to collect audio bytes')
-                audio_bytes = response.content or b''
-            else:
-                # Fallback: try to stream to a temp file using provided helper
-                tmp_path = Path(TTS_OUTPUT_FOLDER) / f"tmp-tts-{int(datetime.utcnow().timestamp())}.wav"
-                try:
-                    if hasattr(response, 'stream_to_file'):
-                        print(f'[PLAYAI-TTS] Falling back to response.stream_to_file -> {tmp_path}')
-                        response.stream_to_file(tmp_path)
-                        with open(tmp_path, 'rb') as f:
-                            audio_bytes = f.read()
-                        try:
-                            os.remove(tmp_path)
-                        except Exception:
-                            pass
-                    else:
-                        print('[PLAYAI-TTS] Response has no known byte access methods')
-                except Exception as e:
-                    print(f'[PLAYAI-TTS] fallback stream_to_file failed: {e}')
-        except Exception as e:
-            print(f'[PLAYAI-TTS] Error while extracting bytes from response: {e}')
+        print(f"[GCP-TTS] Retrieved audio bytes length: {len(audio_bytes) if audio_bytes is not None else 'None'}")
 
-        print(f"[PLAYAI-TTS] Retrieved audio bytes length: {len(audio_bytes) if audio_bytes is not None else 'None'}")
-
-        # Validate audio content
         if not audio_bytes:
-            # Provide as much debug info as possible
-            debug_info = None
-            try:
-                # Some response objects provide a .status_code or .text
-                debug_info = {
-                    'has_iter_bytes': hasattr(response, 'iter_bytes'),
-                    'has_content': hasattr(response, 'content'),
-                    'repr': repr(response)[:1000]
-                }
-            except Exception:
-                debug_info = repr(response)[:1000]
-            print(f"[PLAYAI-TTS] ERROR: No audio bytes were retrieved from the TTS response. Debug: {debug_info}")
-            return jsonify({"error": "TTS generation returned no audio bytes", "debug": debug_info}), 502
+            print("[GCP-TTS] ERROR: No audio bytes were retrieved from the TTS response.")
+            return jsonify({"error": "TTS generation returned no audio bytes"}), 502
 
         # Store in MongoDB GridFS
         if fs is None:
@@ -748,7 +760,7 @@ def learning_tts():
         filename_label = safe_folder or "default"
         filename = f"learning-tts-{filename_label}-{timestamp}.wav"
         gridfs_id = fs.put(audio_bytes, filename=filename, contentType="audio/wav", metadata=meta)
-        print(f"[PLAYAI-TTS] Saved audio to MongoDB GridFS with id: {gridfs_id}, filename: {filename}")
+        print(f"[GCP-TTS] Saved audio to MongoDB GridFS with id: {gridfs_id}, filename: {filename}")
 
         # Associate with a file document in `files` collection (already fetched above)
 
@@ -772,9 +784,9 @@ def learning_tts():
                 summary_path = os.path.join(local_folder, 'summary.txt')
                 with open(summary_path, 'w', encoding='utf-8') as sf:
                     sf.write(text)
-                print(f"[PLAYAI-TTS] Wrote summary.txt to {summary_path}")
+                print(f"[GCP-TTS] Wrote summary.txt to {summary_path}")
             except Exception as e:
-                print(f"[PLAYAI-TTS] Warning: failed to write summary.txt locally: {e}")
+                print(f"[GCP-TTS] Warning: failed to write summary.txt locally: {e}")
 
             # save audio locally
             local_audio_name = audio_meta['filename']
@@ -782,11 +794,11 @@ def learning_tts():
             try:
                 with open(local_audio_path, 'wb') as af:
                     af.write(audio_bytes)
-                print(f"[PLAYAI-TTS] Wrote audio file locally to {local_audio_path}")
+                print(f"[GCP-TTS] Wrote audio file locally to {local_audio_path}")
             except Exception as e:
-                print(f"[PLAYAI-TTS] Warning: failed to write audio file locally: {e}")
+                print(f"[GCP-TTS] Warning: failed to write audio file locally: {e}")
         except Exception as e:
-            print(f"[PLAYAI-TTS] Warning: failed to associate or save local files for audio: {e}")
+            print(f"[GCP-TTS] Warning: failed to associate or save local files for audio: {e}")
             local_audio_name = audio_meta['filename']
 
         # Upload audio to S3 so lipsync can fetch the latest file
@@ -794,9 +806,10 @@ def learning_tts():
             s3_upload = upload_audio_to_s3(audio_bytes, local_audio_name, folder=safe_folder)
             audio_meta["s3_key"] = s3_upload["key"]
             audio_meta["s3_url"] = s3_upload["url"]
-            print(f"[PLAYAI-TTS] Uploaded audio to S3: key={s3_upload['key']} url={s3_upload['url']}")
+            print(f"[GCP-TTS] Uploaded audio to S3: key={s3_upload['key']} url={s3_upload['url']}")
+            print(f"[GCP-TTS] [OK] TTS audio generated using GCP (voice: {voice}) and stored in AWS S3 at '{s3_upload['url']}'.")
         except Exception as e:
-            print(f"[PLAYAI-TTS] Error uploading audio to S3: {e}")
+            print(f"[GCP-TTS] Error uploading audio to S3: {e}")
             return jsonify({"error": f"Failed to upload audio to S3: {e}"}), 500
 
         try:
@@ -813,11 +826,11 @@ def learning_tts():
                 }
                 files_collection.insert_one(new_doc)
         except Exception as e:
-            print(f"[PLAYAI-TTS] Warning: failed to write audio metadata to MongoDB: {e}")
+            print(f"[GCP-TTS] Warning: failed to write audio metadata to MongoDB: {e}")
 
         video_payload = None
         try:
-            print(f"[PLAYAI-TTS] Triggering auto lipsync generation for folder='{safe_folder}'")
+            print(f"[GCP-TTS] Triggering auto lipsync generation for folder='{safe_folder}'")
             lipsync_result = generate_lipsync_video(target_folder=safe_folder)
             s3_video = lipsync_result.get("s3_video")
             video_url = s3_video["url"] if s3_video else build_collection_url(lipsync_result["relative_path"])
@@ -827,7 +840,7 @@ def learning_tts():
                 "audio_key": (lipsync_result.get("audio") or {}).get("key"),
                 "audio_url": (lipsync_result.get("audio") or {}).get("url"),
             }
-            print(f"[PLAYAI-TTS] Auto lipsync completed: {video_payload}")
+            print(f"[GCP-TTS] Auto lipsync completed: {video_payload}")
             
             # Save video metadata to MongoDB
             try:
@@ -841,12 +854,12 @@ def learning_tts():
                         {"_id": file_doc["_id"]}, 
                         {"$push": {"videos": video_meta}}
                     )
-                    print(f"[PLAYAI-TTS] Saved video metadata to MongoDB for {safe_folder}")
+                    print(f"[GCP-TTS] Saved video metadata to MongoDB for {safe_folder}")
             except Exception as e:
-                print(f"[PLAYAI-TTS] Warning: failed to save video metadata to MongoDB: {e}")
+                print(f"[GCP-TTS] Warning: failed to save video metadata to MongoDB: {e}")
 
         except Exception as e:
-            print(f"[PLAYAI-TTS] Warning: auto lipsync generation failed: {e}")
+            print(f"[GCP-TTS] Warning: auto lipsync generation failed: {e}")
             video_payload = {"error": str(e)}
 
         # Return both audioId and audio_url for frontend compatibility
@@ -861,11 +874,11 @@ def learning_tts():
             result["local_path"] = os.path.join(safe_folder, local_audio_name)
         if video_payload:
             result["video"] = video_payload
-        print(f"[PLAYAI-TTS] Returning response: {result}")
+        print(f"[GCP-TTS] Returning response: {result}")
         return jsonify(result)
 
     except GroqError as e:
-        print(f"[PLAYAI-TTS] Groq API Error: {e}")
+        print(f"[GCP-TTS] Groq API Error: {e}")
         return jsonify({"error": "Groq/PlayAI TTS request failed", "details": str(e)}), 502
     except Exception as e:
         import traceback
@@ -893,40 +906,22 @@ def qa_tts():
     try:
         data = request.get_json(force=True)
         text = (data or {}).get('text', '').strip()
-        voice = (data or {}).get('voice', 'Nia-PlayAI')
-        fmt = (data or {}).get('format', 'wav')
+        voice = (data or {}).get('voice', GOOGLE_TTS_VOICE_NAME)
+        # GCP TTS (LINEAR16) always produces WAV - kept as "wav" regardless
+        # of what's requested, since nothing in the frontend ever asks for
+        # a different format anyway.
+        fmt = "wav"
 
         if not text:
             return jsonify({"error": "No text provided"}), 400
 
-        # Synthesize using Groq Play.ai model
         target_name = f"qa-tts-{int(datetime.utcnow().timestamp())}.{fmt}"
-        out_path = os.path.join(TTS_OUTPUT_FOLDER, target_name)
-
-        def _do_qa_tts(client, m, v, f, txt):
-            return client.audio.speech.create(
-                model=m,
-                voice=v,
-                response_format=f,
-                input=txt,
-            )
 
         try:
-            resp = execute_with_retry(_do_qa_tts, "playai-tts", voice, fmt, text)
+            audio_bytes = gcp_synthesize_speech(text, voice)
         except Exception as e:
             print(f"[QA-TTS] Error generating audio: {e}")
-            return jsonify({"error": "QA TTS generation failed"}), 500
-
-        # Collect audio bytes
-        audio_bytes = b""
-        try:
-            if hasattr(resp, 'iter_bytes'):
-                for chunk in resp.iter_bytes():
-                    audio_bytes += chunk
-            elif hasattr(resp, 'content'):
-                audio_bytes = resp.content or b''
-        except Exception as e:
-            print(f"[QA-TTS] Error collecting audio bytes: {e}")
+            return jsonify({"error": "QA TTS generation failed", "details": str(e)}), 500
 
         # Store QA TTS in GridFS and associate with file document
         if not audio_bytes:
@@ -937,7 +932,7 @@ def qa_tts():
         qa_meta = {
             "created_at": datetime.utcnow(),
             "voice": voice,
-            "model": "playai-tts",
+            "model": "gcp-tts",
             "format": fmt,
             "text": text,
         }
@@ -981,6 +976,19 @@ def qa_tts():
                 "created_at": datetime.utcnow(),
                 "local_path": os.path.join(safe_folder, target_name)
             }
+
+            # This previously only ever went to GridFS - confirmed nothing
+            # from the AI Tutor chat's "Listen" button ever reached S3,
+            # unlike the Learning Hub's "Play Audio" (/api/learning-tts),
+            # which always has. Same upload path as that one now.
+            try:
+                s3_upload = upload_audio_to_s3(audio_bytes, target_name, folder=safe_folder)
+                audio_meta["s3_key"] = s3_upload["key"]
+                audio_meta["s3_url"] = s3_upload["url"]
+                print(f"[QA-TTS] [OK] TTS audio generated using GCP (voice: {voice}) and stored in AWS S3 at '{s3_upload['url']}'.")
+            except Exception as e:
+                print(f"[QA-TTS] Warning: failed to upload QA audio to S3: {e}")
+
             if file_doc:
                 files_collection.update_one({"_id": file_doc["_id"]}, {"$set": {"folder": safe_folder}})
                 files_collection.update_one({"_id": file_doc["_id"]}, {"$push": {"audios": audio_meta}})
@@ -995,7 +1003,10 @@ def qa_tts():
             print(f"[QA-TTS] Warning: failed to associate QA audio with files collection: {e}")
 
         print(f"[QA-TTS] Stored QA TTS to GridFS with id: {gridfs_id}")
-        return jsonify({"audioId": str(gridfs_id)})
+        result = {"audioId": str(gridfs_id)}
+        if 'audio_meta' in locals() and audio_meta.get("s3_url"):
+            result["s3_url"] = audio_meta["s3_url"]
+        return jsonify(result)
     except Exception as e:
         import traceback
         traceback.print_exc()

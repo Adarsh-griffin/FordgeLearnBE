@@ -20,6 +20,7 @@ load_dotenv(find_dotenv())
 # Import S3 & Lipsync helpers - audio/video only; PDFs are never stored in
 # S3 (see the note above process_file() for why).
 from lipsync import upload_audio_to_s3, generate_lipsync_video
+from reference_links import fetch_reference_links
 
 # MongoDB Setup
 MONGO_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
@@ -146,10 +147,10 @@ def process_file():
         print(f"[PASSMAIN] Summarizing Chunk {i+1}/{min(3, len(chunks))}...")
         prompt = f"""
         You are an expert academic AI tutor.
-        Summarize the following document chunk for a student. Include key topics and 3 reference links if available.
+        Summarize the following document chunk for a student, highlighting the key topics covered.
 
         Previous Context: {prev_summary}
-        
+
         Text Chunk:
         {chunk[:2500]}
         """
@@ -157,12 +158,27 @@ def process_file():
         if not explanation_text:
             explanation_text = "Summary preview for this section."
 
-        parsed_output = {
-            "explanation": explanation_text,
-            "links": ["https://en.wikipedia.org/wiki/Special:Search?search=education"]
-        }
+        parsed_output = {"explanation": explanation_text}
         output.append(parsed_output)
         prev_summary = explanation_text[-500:]
+
+    # Real reference links (was a single hardcoded Wikipedia search URL
+    # returned for every document, every time - the prompt above used to
+    # ask the LLM for "3 reference links" but the code never actually
+    # parsed any out of its response, so the placeholder was all anyone
+    # ever saw). One search covering the whole document is enough - the
+    # frontend already flattens every chunk's links into one combined list,
+    # so there was never a reason to search per-chunk.
+    fallback_topic = os.path.splitext(os.path.basename(pdf_path))[0].replace('_', ' ').replace('-', ' ').strip()
+    topic_prompt = (
+        "In 3-6 words, what is the main topic of this text? "
+        "Reply with ONLY the topic phrase - no punctuation, no explanation.\n\n"
+        f"Text: {output[0]['explanation'][:800]}"
+    )
+    search_topic = (groq_generate(topic_prompt, max_tokens=20, temperature=0.2) or "").strip().strip('"\'')
+    real_links = fetch_reference_links(search_topic or fallback_topic)
+    for item in output:
+        item["links"] = real_links
 
     # Save explanation array to MongoDB, against this exact document's _id
     save_explanation_to_mongo(file_doc["_id"], output)
