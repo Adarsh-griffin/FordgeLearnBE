@@ -120,7 +120,37 @@ def groq_generate(prompt, model="openai/gpt-oss-20b", max_tokens=512, temperatur
         return None
 
 
-def groq_generate_json(prompt: str, max_tokens: int = 900, temperature: float = 0.4):
+def _parse_json_response(text: str):
+    """Strips code fences and parses JSON, repairing the one known-common
+    malformation (see groq_generate_json's docstring). Returns None, never
+    raises - callers check for None."""
+    if not text:
+        return None
+    cleaned = re.sub(r'^```(?:json)?\s*', '', text.strip())
+    cleaned = re.sub(r'\s*```$', '', cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        # Reproducibly triggered by lesson content containing LaTeX (the
+        # lesson/example fields are meant to include math, rendered via
+        # KaTeX on the frontend) - "\Delta", "\times" etc. are valid LaTeX
+        # but NOT valid JSON string escapes, so the model emitting them
+        # un-doubled inside a JSON string breaks json.loads with "Invalid
+        # \escape" every time. Escaping any backslash not already forming a
+        # legal JSON escape sequence and retrying recovers the exact same
+        # content without corrupting genuinely valid escapes (\n, \", \\,
+        # \uXXXX, ...).
+        repaired = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', cleaned)
+        if repaired != cleaned:
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError:
+                pass
+        print(f"[GROQ] groq_generate_json: failed to parse JSON: {e}\nRaw: {cleaned[:300]}")
+        return None
+
+
+def groq_generate_json(prompt: str, max_tokens: int = 900, temperature: float = 0.4, retries: int = 2):
     """
     Plain-text completion + manual JSON parsing, instead of
     response_format={"type": "json_object"} (what groq_generate's json_mode
@@ -129,8 +159,20 @@ def groq_generate_json(prompt: str, max_tokens: int = 900, temperature: float = 
     json_validate_failed, every retry/key rotation, regardless of prompt
     wording (found while building the diagnostic quiz's MCQ generation).
     This is the preferred path for any new structured-output call.
-    Returns None on any failure - callers must treat that as "try again
-    later", never as a value to trust blindly.
+
+    A successful API call can still come back with text that isn't valid
+    JSON even after the backslash repair (truncated output, a stray
+    unescaped control character, etc.) - that used to be treated as final
+    and returned None immediately, with no fresh attempt, which is exactly
+    what caused a real observed bug: lesson generation 502'd on the first
+    try and then succeeded immediately when the user tapped "Try Again" -
+    the retry worked because the SAME broken text was never going to parse
+    no matter how many times it was re-parsed, but a fresh generation
+    usually isn't malformed the same way twice. This now does that retry
+    internally so the user doesn't have to.
+
+    Returns None only after every attempt fails - callers must still treat
+    that as "try again later", never as a value to trust blindly.
     """
     def _do_generate(client, p, mt, temp):
         completion = client.chat.completions.create(
@@ -144,35 +186,18 @@ def groq_generate_json(prompt: str, max_tokens: int = 900, temperature: float = 
         )
         return completion.choices[0].message.content
 
-    try:
-        text = execute_with_retry(_do_generate, prompt, max_tokens, temperature)
-    except Exception as e:
-        print(f"[GROQ] groq_generate_json failed after retries: {e}")
-        return None
+    for attempt in range(retries + 1):
+        try:
+            text = execute_with_retry(_do_generate, prompt, max_tokens, temperature)
+        except Exception as e:
+            print(f"[GROQ] groq_generate_json failed after retries: {e}")
+            return None
 
-    if not text:
-        return None
+        result = _parse_json_response(text)
+        if result is not None:
+            return result
 
-    cleaned = re.sub(r'^```(?:json)?\s*', '', text.strip())
-    cleaned = re.sub(r'\s*```$', '', cleaned)
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        # Reproducibly triggered by lesson content containing LaTeX (the
-        # lesson/example fields are meant to include math, rendered via
-        # KaTeX on the frontend) - "\Delta", "\times" etc. are valid LaTeX
-        # but NOT valid JSON string escapes, so the model emitting them
-        # un-doubled inside a JSON string breaks json.loads with "Invalid
-        # \escape" every time (confirmed: consistently failed on RAG lesson
-        # generation before this fix, 100% of attempts). Escaping any
-        # backslash not already forming a legal JSON escape sequence and
-        # retrying recovers the exact same content without corrupting
-        # genuinely valid escapes (\n, \", \\, \uXXXX, ...).
-        repaired = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', cleaned)
-        if repaired != cleaned:
-            try:
-                return json.loads(repaired)
-            except json.JSONDecodeError:
-                pass
-        print(f"[GROQ] groq_generate_json: failed to parse JSON: {e}\nRaw: {cleaned[:300]}")
-        return None
+        if attempt < retries:
+            print(f"[GROQ] groq_generate_json: attempt {attempt + 1}/{retries + 1} returned unparseable JSON - regenerating fresh instead of giving up.")
+
+    return None
