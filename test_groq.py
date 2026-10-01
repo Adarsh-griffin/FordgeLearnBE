@@ -1868,6 +1868,43 @@ def tutor_plan_generate():
     return jsonify(study_plan)
 
 
+def ensure_tutor_lesson_audio(current_lesson, topic_id, file_id):
+    """
+    Ensures that a lesson payload has a valid GCP TTS synthesized audio URL stored in AWS S3.
+    If audio_url is already present, returns it immediately.
+    """
+    if not current_lesson:
+        return None
+    if current_lesson.get("audio_url"):
+        return current_lesson.get("audio_url")
+
+    explanation = current_lesson.get("explanation") or ""
+    if not explanation:
+        return None
+
+    import re
+    cleaned_text = re.sub(r'[\*\#\_\`]', '', explanation)
+    cleaned_text = re.sub(r'\\\(|\\\)', '', cleaned_text)
+    cleaned_text = re.sub(r'\$\$|\$', '', cleaned_text)
+    text_to_speak = cleaned_text[:3500].strip()
+
+    try:
+        audio_bytes = gcp_synthesize_speech(text_to_speak)
+        timestamp = int(time.time())
+        safe_topic = re.sub(r'[^a-zA-Z0-9_-]', '_', str(topic_id))
+        filename = f"tutor-{safe_topic}-{timestamp}.wav"
+        folder = str(file_id or "tutor-lessons")
+        s3_info = upload_audio_to_s3(audio_bytes, filename, folder=folder)
+        audio_url = s3_info["url"]
+        current_lesson["audio_url"] = audio_url
+        print(f"[TUTOR-TTS] Generated GCP TTS audio & uploaded to S3: {audio_url}")
+        return audio_url
+    except Exception as e:
+        print(f"[TUTOR-TTS] Warning: Failed to synthesize/upload tutor TTS audio: {e}")
+        current_lesson["audio_url"] = None
+        return None
+
+
 @app.route('/api/tutor/lesson/next', methods=['POST'])
 @require_auth
 def tutor_lesson_next():
@@ -1924,6 +1961,12 @@ def tutor_lesson_next():
         and existing_lesson.get("topic_id") == topic_id
         and existing_lesson.get("is_remediation") == is_remediation
     ):
+        if not existing_lesson.get("audio_url") and existing_lesson.get("explanation"):
+            ensure_tutor_lesson_audio(existing_lesson, topic_id, file_id)
+            student_profiles_collection.update_one(
+                {"_id": profile["_id"]},
+                {"$set": {"current_lesson.audio_url": existing_lesson.get("audio_url")}}
+            )
         return jsonify({
             "done": False,
             "topic_id": topic_id,
@@ -1936,6 +1979,7 @@ def tutor_lesson_next():
             "explanation": existing_lesson["explanation"],
             "example": existing_lesson["example"],
             "checkpoint_question": existing_lesson["checkpoint_question"],
+            "audio_url": existing_lesson.get("audio_url"),
             "images": get_or_fetch_topic_images(file_doc, topic),
             "step_index": step_index,
             "total_steps": len(steps),
@@ -1960,6 +2004,8 @@ def tutor_lesson_next():
         **lesson_payload,
     }
 
+    ensure_tutor_lesson_audio(current_lesson, topic_id, file_id)
+
     student_profiles_collection.update_one(
         {"_id": profile["_id"]},
         {
@@ -1980,10 +2026,46 @@ def tutor_lesson_next():
         "explanation": lesson_payload["explanation"],
         "example": lesson_payload["example"],
         "checkpoint_question": lesson_payload["checkpoint_question"],
+        "audio_url": current_lesson.get("audio_url"),
         "images": get_or_fetch_topic_images(file_doc, topic),
         "step_index": step_index,
         "total_steps": len(steps),
     })
+
+
+@app.route('/api/tutor/tts', methods=['POST'])
+@require_auth
+def tutor_tts_on_demand():
+    """
+    On-demand GCP TTS synthesis and S3 upload for AI Tutor text.
+    """
+    data = request.get_json(silent=True) or {}
+    text = (data.get('text') or '').strip()
+    file_id = (data.get('fileId') or data.get('file_id') or 'tutor-general').strip()
+    topic_id = (data.get('topicId') or data.get('topic_id') or 'tutor-topic').strip()
+
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+
+    import re
+    cleaned_text = re.sub(r'[\*\#\_\`]', '', text)
+    cleaned_text = re.sub(r'\\\(|\\\)', '', cleaned_text)
+    cleaned_text = re.sub(r'\$\$|\$', '', cleaned_text)
+
+    try:
+        audio_bytes = gcp_synthesize_speech(cleaned_text[:3500])
+        timestamp = int(time.time())
+        safe_topic = re.sub(r'[^a-zA-Z0-9_-]', '_', topic_id)
+        filename = f"tutor-{safe_topic}-{timestamp}.wav"
+        s3_info = upload_audio_to_s3(audio_bytes, filename, folder=file_id)
+        return jsonify({
+            "success": True,
+            "audio_url": s3_info["url"],
+            "key": s3_info["key"]
+        })
+    except Exception as e:
+        print(f"[TUTOR-TTS-ON-DEMAND] Error: {e}")
+        return jsonify({"error": f"Failed to generate speech audio: {str(e)}"}), 500
 
 
 @app.route('/api/tutor/lesson/checkpoint', methods=['POST'])
