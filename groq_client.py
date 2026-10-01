@@ -120,14 +120,32 @@ def groq_generate(prompt, model="openai/gpt-oss-20b", max_tokens=512, temperatur
         return None
 
 
+# LaTeX macros starting with t/n/b/f/r/u - the exact letters JSON treats as
+# legal single-char escapes (\t \n \b \f \r \u). "\times" etc. therefore
+# never raises JSONDecodeError at all: json.loads silently reads "\t" as a
+# TAB character and leaves "imes" as trailing text, corrupting the string
+# without ever failing, so this has to be escaped BEFORE the first parse
+# attempt - the except-block repair below never even runs for these.
+_LATEX_ESCAPE_COLLISION_WORDS = (
+    r'times|text\w*|tan\w*|theta|to|triangle\w*|tilde|top|'
+    r'nabla|neq|ne|nu|not\w*|'
+    r'beta|binom|bar|boxed|bullet|big\w*|boldsymbol|'
+    r'frac|forall|'
+    r'rightarrow|rho|right\w*|rfloor|rceil|'
+    r'upsilon|underline\w*|underbrace|uparrow'
+)
+_LATEX_ESCAPE_COLLISION_RE = re.compile(r'\\(?=(?:' + _LATEX_ESCAPE_COLLISION_WORDS + r')\b)')
+
+
 def _parse_json_response(text: str):
-    """Strips code fences and parses JSON, repairing the one known-common
-    malformation (see groq_generate_json's docstring). Returns None, never
+    """Strips code fences and parses JSON, repairing the known-common
+    malformations (see groq_generate_json's docstring). Returns None, never
     raises - callers check for None."""
     if not text:
         return None
     cleaned = re.sub(r'^```(?:json)?\s*', '', text.strip())
     cleaned = re.sub(r'\s*```$', '', cleaned)
+    cleaned = _LATEX_ESCAPE_COLLISION_RE.sub(r'\\\\', cleaned)
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError as e:

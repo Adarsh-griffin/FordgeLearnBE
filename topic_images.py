@@ -20,6 +20,7 @@ matter how many students study the same document.
 import os
 import requests
 from dotenv import load_dotenv, find_dotenv
+from topic_domains import preferred_domains, site_restricted_query
 
 load_dotenv(find_dotenv())
 
@@ -27,8 +28,56 @@ SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
 SERPER_URL = "https://google.serper.dev/images"
 
 
+def _is_image_reachable(url: str) -> bool:
+    """Quick HEAD check (GET fallback, since some hosts reject HEAD) that a
+    Serper result URL actually loads as an image - a meaningful fraction of
+    raw search-result URLs are hotlink-protected or dead, which otherwise
+    only surfaces as a permanently broken <img> on the frontend with no way
+    to tell which slot will fail ahead of time."""
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; LearnForgeBot/1.0)"}
+    try:
+        resp = requests.head(url, headers=headers, timeout=4, allow_redirects=True)
+        if resp.status_code < 400 and resp.headers.get("content-type", "").startswith("image/"):
+            return True
+        if resp.status_code in (405, 403):
+            # Some hosts reject HEAD specifically but serve GET fine.
+            resp = requests.get(url, headers=headers, timeout=4, stream=True)
+            ok = resp.status_code < 400 and resp.headers.get("content-type", "").startswith("image/")
+            resp.close()
+            return ok
+        return False
+    except Exception:
+        return False
+
+
+def _search_image_candidates(query: str, num: int) -> list:
+    """One Serper Images call -> list of raw image URLs, or [] on failure."""
+    resp = requests.post(
+        SERPER_URL,
+        headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+        json={"q": query, "num": num, "autocorrect": True, "safe": "active"},
+        timeout=10,
+    )
+    if resp.status_code == 429:
+        print(f"[QUOTA LIMIT HIT] Serper key '...{SERPER_API_KEY[-6:]}' hit its rate/usage limit (429) - "
+              f"you need a fresh SERPER_API_KEY. Skipping images for '{query}'.")
+        return []
+    if resp.status_code in (401, 403):
+        print(f"[INVALID KEY] Serper key '...{SERPER_API_KEY[-6:]}' was rejected ({resp.status_code}) - "
+              f"it's likely invalid or expired. Replace SERPER_API_KEY in .env.")
+        return []
+    resp.raise_for_status()
+    return [img["imageUrl"] for img in resp.json().get("images", []) if img.get("imageUrl")]
+
+
 def fetch_topic_images(topic_title: str, limit: int = 4) -> list:
-    """Top `limit` image URLs for this topic, or [] on any failure/missing key."""
+    """Top `limit` VERIFIED-reachable image URLs for this topic, or [] on
+    any failure/missing key. Prefers trusted subject-specific domains
+    (GeeksforGeeks/W3Schools for programming/CS topics, BYJU'S/Vedantu/
+    Toppr/Aakash for everything else), tops up with a plain unrestricted
+    search if that doesn't return enough, and filters out dead/hotlink-
+    protected results at every step so a broken thumbnail never gets
+    cached."""
     if not SERPER_API_KEY:
         print("[TOPIC-IMAGES] [SKIPPED] SERPER_API_KEY is not set - no images will be fetched for any topic.")
         return []
@@ -36,30 +85,34 @@ def fetch_topic_images(topic_title: str, limit: int = 4) -> list:
         print("[TOPIC-IMAGES] [SKIPPED] No topic title given - nothing to search for.")
         return []
 
-    print(f"[TOPIC-IMAGES] Searching Serper for images on: '{topic_title}'...")
+    domains = preferred_domains(topic_title)
+    print(f"[TOPIC-IMAGES] Searching Serper for images on: '{topic_title}' "
+          f"(preferring {', '.join(domains)})...")
     try:
-        resp = requests.post(
-            SERPER_URL,
-            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-            json={"q": f"{topic_title} educational diagram", "num": limit, "autocorrect": True, "safe": "active"},
-            timeout=10,
-        )
-        if resp.status_code == 429:
-            print(f"[QUOTA LIMIT HIT] Serper key '...{SERPER_API_KEY[-6:]}' hit its rate/usage limit (429) - "
-                  f"you need a fresh SERPER_API_KEY. Skipping images for '{topic_title}'.")
-            return []
-        if resp.status_code in (401, 403):
-            print(f"[INVALID KEY] Serper key '...{SERPER_API_KEY[-6:]}' was rejected ({resp.status_code}) - "
-                  f"it's likely invalid or expired. Replace SERPER_API_KEY in .env.")
-            return []
-        resp.raise_for_status()
+        over_fetch = max(limit * 3, limit + 6)
+        query = f"{topic_title} educational diagram"
 
-        images = resp.json().get("images", [])
-        urls = [img["imageUrl"] for img in images[:limit] if img.get("imageUrl")]
+        candidates = _search_image_candidates(site_restricted_query(query, domains), over_fetch)
+        if len(candidates) < over_fetch:
+            seen = set(candidates)
+            for url in _search_image_candidates(query, over_fetch):
+                if url not in seen:
+                    candidates.append(url)
+                    seen.add(url)
+
+        urls = []
+        for candidate in candidates:
+            if _is_image_reachable(candidate):
+                urls.append(candidate)
+                if len(urls) >= limit:
+                    break
+
         if urls:
-            print(f"[TOPIC-IMAGES] [OK] Found {len(urls)} image(s) for '{topic_title}'.")
+            print(f"[TOPIC-IMAGES] [OK] Found {len(urls)}/{limit} verified image(s) for '{topic_title}' "
+                  f"(checked {len(candidates)} candidate(s)).")
         else:
-            print(f"[TOPIC-IMAGES] [NOTICE] Serper returned no usable images for '{topic_title}'.")
+            print(f"[TOPIC-IMAGES] [NOTICE] No verified-reachable images for '{topic_title}' "
+                  f"(checked {len(candidates)} candidate(s)).")
         return urls
     except Exception as e:
         print(f"[TOPIC-IMAGES] [ERROR] Failed to fetch images for '{topic_title}': {e}")
