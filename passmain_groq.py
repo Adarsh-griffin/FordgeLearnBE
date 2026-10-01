@@ -20,6 +20,7 @@ load_dotenv(find_dotenv())
 # Import S3 & Lipsync helpers - audio/video only; PDFs are never stored in
 # S3 (see the note above process_file() for why).
 from lipsync import upload_audio_to_s3, generate_lipsync_video
+from gcp_tts import synthesize_speech
 from reference_links import fetch_reference_links
 
 # MongoDB Setup
@@ -183,6 +184,35 @@ def process_file():
     # Save explanation array to MongoDB, against this exact document's _id
     save_explanation_to_mongo(file_doc["_id"], output)
     print("[PASSMAIN] [OK] Document explanation processing completed and saved to MongoDB!\n")
+
+    # Auto-generate summary speech audio & Tavus summary video
+    try:
+        summary_text = " ".join(item.get("explanation", "") for item in output if isinstance(item, dict))
+        if summary_text.strip():
+            safe_folder = file_doc.get("folder") or secure_filename(os.path.basename(pdf_path))
+            print(f"[PASSMAIN] Synthesizing summary audio for document '{safe_folder}' using GCP TTS...")
+            audio_bytes = synthesize_speech(summary_text[:3500])
+            timestamp = int(time.time())
+            filename = f"summary-{timestamp}.wav"
+            s3_upload = upload_audio_to_s3(audio_bytes, filename, folder=safe_folder)
+            print(f"[PASSMAIN] Uploaded summary audio to S3: {s3_upload['url']}")
+
+            print(f"[PASSMAIN] Triggering summary video generation for folder='{safe_folder}'...")
+            lipsync_res = generate_lipsync_video(target_folder=safe_folder, audio_url=s3_upload["url"])
+            video_url = (lipsync_res.get("s3_video") or {}).get("url")
+            print(f"🎉 [PASSMAIN] Summary video generated and uploaded to S3: {video_url or lipsync_res.get('relative_path')}")
+
+            video_meta = {
+                "video_url": video_url,
+                "video_filename": lipsync_res.get("video_filename"),
+                "created_at": datetime.utcnow(),
+                "relative_path": lipsync_res.get("relative_path"),
+                "source_audio_url": s3_upload["url"],
+            }
+            collection.update_one({"_id": file_doc["_id"]}, {"$push": {"videos": video_meta, "audios": {"s3_url": s3_upload["url"], "filename": filename, "created_at": datetime.utcnow()}}})
+            print(f"💾 [PASSMAIN] Saved video metadata to MongoDB for document _id={file_doc['_id']}")
+    except Exception as exc:
+        print(f"[PASSMAIN] Warning: Auto summary audio/video generation failed: {exc}")
 
 if __name__ == '__main__':
     process_file()

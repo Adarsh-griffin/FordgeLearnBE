@@ -6,6 +6,8 @@ previously called Groq's PlayAI TTS model directly and independently;
 this is the one place that talks to GCP now, so every caller gets the
 exact same voice everywhere, by design.
 """
+import html
+import re
 import os
 import base64
 import requests
@@ -18,24 +20,79 @@ GOOGLE_TTS_VOICE_NAME = os.getenv("GOOGLE_TTS_VOICE_NAME", "en-US-Studio-O").str
 GOOGLE_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
 
 
+def clean_text_for_tts(text: str) -> str:
+    """
+    Sanitizes markdown, HTML tags (<...>), LaTeX, URLs, and structural code tokens
+    so GCP TTS speaks ONLY clean, natural human words matching what is rendered on screen.
+    """
+    if not text:
+        return ""
+
+    # Decode HTML entities like &lt; &gt; &amp; &quot;
+    s = html.unescape(text)
+
+    # 1. Strip raw HTML tags completely (e.g. <div class="...">, <span>, <br/>, <p>, <fileId>)
+    s = re.sub(r'<[^>]+>', ' ', s)
+
+    # 2. Strip Markdown Image links ![alt](url) and Hyperlinks [text](url) -> keep only 'text'
+    s = re.sub(r'!\[.*?\]\(.*?\)', ' ', s)
+    s = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', s)
+
+    # 3. Strip URLs (http://... or https://...)
+    s = re.sub(r'https?://\S+', ' ', s)
+
+    # 4. Strip Code blocks ```...``` and inline code `...`
+    s = re.sub(r'```[\s\S]*?```', ' ', s)
+    s = re.sub(r'`([^`]+)`', r'\1', s)
+
+    # 5. Clean LaTeX / Math expressions ($$x=y$$ or \(x=y\)) -> keep inner text or clean symbols
+    s = re.sub(r'\$\$([\s\S]*?)\$\$', r'\1', s)
+    s = re.sub(r'\$([^\$]+)\$', r'\1', s)
+    s = re.sub(r'\\\(|\\\)', ' ', s)
+    s = re.sub(r'\\\[|\\\]', ' ', s)
+    s = re.sub(r'\\frac\{([^}]+)\}\{([^}]+)\}', r'\1 over \2', s)
+
+    # 6. Replace mathematical symbols with natural spoken English words
+    s = re.sub(r'\s*<\s*=', ' is less than or equal to ', s)
+    s = re.sub(r'\s*>\s*=', ' is greater than or equal to ', s)
+    s = re.sub(r'\s*<\s*', ' is less than ', s)
+    s = re.sub(r'\s*>\s*', ' is greater than ', s)
+    s = re.sub(r'\s*=\s*', ' equals ', s)
+    s = re.sub(r'\s*\+\s*', ' plus ', s)
+    s = re.sub(r'\s*─►|\s*─>|\s*->|\s*➔|\s*→\s*', ' leads to ', s)
+
+    # 7. Strip structural Markdown tokens (#, ##, ###, *, **, _, __, ||, --, ~~, >)
+    s = re.sub(r'#{1,6}\s*', ' ', s)
+    s = re.sub(r'[\*\_\~\#\|\-\=]{2,}', ' ', s)
+    s = re.sub(r'[\*\_\~]', ' ', s)
+
+    # 8. Strip visual emoji boxes / block icons (🟦, 🟪, 🟧, 🟩, 💡, 🧑‍🏫, 📌, ⚠️, 🔬, 🧠)
+    s = re.sub(r'[🟦🟪🟧🟩💡🧑‍🏫📌⚠️🔬🧠✓]', ' ', s)
+
+    # 9. Clean up multiple whitespaces & newlines
+    s = re.sub(r'\s+', ' ', s)
+    
+    return s.strip()
+
+
 def synthesize_speech(text: str, voice_name: str | None = None) -> bytes:
     """
     Synthesizes `text` with GCP TTS and returns raw WAV bytes (LINEAR16 -
     matches every existing call site's "audio/wav" content type and .wav
     filenames, so nothing downstream - GridFS storage, S3 upload, lipsync -
     needs to change any format handling).
-
-    Raises RuntimeError with a clear message on any failure - every caller
-    already wraps its TTS call in a try/except and expects an exception on
-    failure, not a silent empty result.
     """
     if not GOOGLE_TTS_API_KEY:
         raise RuntimeError("GOOGLE_TTS_API_KEY is not set in .env")
     if not text:
         raise RuntimeError("No text provided to synthesize")
 
+    # Automatically clean HTML tags, markdown symbols, LaTeX, < > etc.
+    cleaned = clean_text_for_tts(text)
+    text_payload = cleaned if cleaned else text
+
     payload = {
-        "input": {"text": text},
+        "input": {"text": text_payload[:4500]},
         "voice": {
             "languageCode": "en-US",
             "name": voice_name or GOOGLE_TTS_VOICE_NAME,

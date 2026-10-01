@@ -830,22 +830,21 @@ def learning_tts():
 
         video_payload = None
         try:
-            print(f"[GCP-TTS] Triggering auto lipsync generation for folder='{safe_folder}'")
-            lipsync_result = generate_lipsync_video(target_folder=safe_folder)
+            print(f"🎬 [GCP-TTS] Triggering auto lipsync video generation for folder='{safe_folder}' using S3 audio_url='{s3_upload['url']}'...")
+            lipsync_result = generate_lipsync_video(target_folder=safe_folder, audio_url=s3_upload["url"])
             s3_video = lipsync_result.get("s3_video")
             video_url = s3_video["url"] if s3_video else build_collection_url(lipsync_result["relative_path"])
             video_payload = {
                 "video_url": video_url,
                 "video_filename": lipsync_result.get("video_filename"),
                 "audio_key": (lipsync_result.get("audio") or {}).get("key"),
-                "audio_url": (lipsync_result.get("audio") or {}).get("url"),
+                "audio_url": (lipsync_result.get("audio") or {}).get("url") or s3_upload["url"],
             }
-            print(f"[GCP-TTS] Auto lipsync completed: {video_payload}")
+            print(f"🎉 [GCP-TTS] Auto lipsync summary video generated & stored successfully! Video URL: {video_url}")
             
             # Save video metadata to MongoDB
             try:
                 if file_doc:
-                    # Enrich payload with timestamp for sorting
                     video_meta = video_payload.copy()
                     video_meta["created_at"] = datetime.utcnow()
                     video_meta["relative_path"] = lipsync_result.get("relative_path")
@@ -854,12 +853,14 @@ def learning_tts():
                         {"_id": file_doc["_id"]}, 
                         {"$push": {"videos": video_meta}}
                     )
-                    print(f"[GCP-TTS] Saved video metadata to MongoDB for {safe_folder}")
+                    print(f"💾 [GCP-TTS] Saved video metadata to MongoDB for folder '{safe_folder}'")
             except Exception as e:
                 print(f"[GCP-TTS] Warning: failed to save video metadata to MongoDB: {e}")
 
         except Exception as e:
-            print(f"[GCP-TTS] Warning: auto lipsync generation failed: {e}")
+            print(f"❌ [GCP-TTS] Warning: auto lipsync video generation failed: {e}")
+            import traceback
+            traceback.print_exc()
             video_payload = {"error": str(e)}
 
         # Return both audioId and audio_url for frontend compatibility
@@ -1159,26 +1160,60 @@ def generate_lipsync_video_endpoint():
         return jsonify({"error": "Database connection is not available."}), 500
     data = request.get_json(silent=True) or {}
     file_name_req = data.get('fileName') or data.get('file_name')
+    audio_url_req = data.get('audioUrl') or data.get('audio_url')
     file_doc, safe_folder = resolve_file_context(file_name_req)
 
+    # If no audio_url was explicitly passed, search file_doc or synthesize summary audio on demand
+    if not audio_url_req and file_doc:
+        audios = file_doc.get("audios") or []
+        if audios and isinstance(audios, list) and audios[-1].get("s3_url"):
+            audio_url_req = audios[-1]["s3_url"]
+        elif file_doc.get("explanation"):
+            try:
+                explanations = file_doc.get("explanation")
+                if isinstance(explanations, list):
+                    summary_text = " ".join(item.get("explanation", "") for item in explanations if isinstance(item, dict))
+                else:
+                    summary_text = str(explanations)
+                if summary_text.strip():
+                    print(f"🔊 [LIPSYNC-GENERATE] Synthesizing summary audio on demand for document '{safe_folder}' using GCP TTS...")
+                    audio_bytes = gcp_synthesize_speech(summary_text[:3500])
+                    timestamp = int(time.time())
+                    filename = f"summary-{timestamp}.wav"
+                    s3_info = upload_audio_to_s3(audio_bytes, filename, folder=safe_folder)
+                    audio_url_req = s3_info["url"]
+                    files_collection.update_one({"_id": file_doc["_id"]}, {"$push": {"audios": {"s3_url": audio_url_req, "filename": filename, "created_at": datetime.utcnow()}}})
+                    print(f"✅ [LIPSYNC-GENERATE] Uploaded summary audio to S3: {audio_url_req}")
+            except Exception as exc:
+                print(f"⚠️ [LIPSYNC-GENERATE] Warning: On-demand audio synthesis failed: {exc}")
+
     try:
-        result = generate_lipsync_video(target_folder=safe_folder)
+        print(f"🎬 [LIPSYNC-ENDPOINT] Summary video generation requested for folder='{safe_folder}', audio_url='{audio_url_req}'")
+        result = generate_lipsync_video(target_folder=safe_folder, audio_url=audio_url_req)
+        print(f"🎉 [LIPSYNC-ENDPOINT] Summary video successfully generated: {result.get('video_filename')}")
     except Exception as exc:
-        print(f"[LIPSYNC] Generation failed: {exc}")
+        print(f"❌ [LIPSYNC-ENDPOINT] Summary video generation failed: {exc}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(exc)}), 500
+
+    s3_video = result.get("s3_video")
+    final_video_url = s3_video["url"] if s3_video else build_collection_url(result.get("relative_path"))
 
     video_meta = {
         "filename": result.get("video_filename"),
         "relative_path": result.get("relative_path"),
         "created_at": datetime.utcnow(),
         "source_audio_key": (result.get("audio") or {}).get("key"),
-        "source_audio_url": (result.get("audio") or {}).get("url"),
+        "source_audio_url": (result.get("audio") or {}).get("url") or audio_url_req,
         "tavus_video_id": (result.get("tavus") or {}).get("video_id"),
+        "video_url": final_video_url,
     }
 
     if file_doc:
         files_collection.update_one({"_id": file_doc["_id"]}, {"$set": {"folder": safe_folder}})
         files_collection.update_one({"_id": file_doc["_id"]}, {"$push": {"videos": video_meta}})
+        print(f"💾 [LIPSYNC-ENDPOINT] Saved video metadata to MongoDB for document _id={file_doc['_id']}")
     else:
         files_collection.insert_one({
             "originalName": file_name_req or f"unnamed-video-{int(datetime.utcnow().timestamp())}",
@@ -1188,7 +1223,7 @@ def generate_lipsync_video_endpoint():
         })
 
     payload = {
-        "video_url": build_collection_url(video_meta["relative_path"]),
+        "video_url": final_video_url,
         "folder": safe_folder,
         "video_filename": video_meta["filename"],
         "audio_key": video_meta["source_audio_key"],

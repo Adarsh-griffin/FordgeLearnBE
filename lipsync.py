@@ -205,20 +205,42 @@ def upload_video_to_s3(
 def get_latest_audio_from_s3(folder: Optional[str] = None) -> Optional[Dict[str, str]]:
     """Return the latest (newest LastModified) audio object for a folder."""
     client = get_s3_client()
-    params = {"Bucket": AWS_AUDIO_BUCKET}
-    prefix = build_audio_prefix(folder)
-    if prefix:
-        params["Prefix"] = prefix if prefix.endswith("/") else f"{prefix}/"
     paginator = client.get_paginator("list_objects_v2")
     latest_obj = None
-    for page in paginator.paginate(**params):
-        for obj in page.get("Contents", []):
-            if obj.get("Size", 0) == 0:  # Skip empty folder markers
-                continue
-            if latest_obj is None or obj["LastModified"] > latest_obj["LastModified"]:
-                latest_obj = obj
+
+    prefixes_to_try = []
+    if folder:
+        clean_folder = folder.strip("/")
+        if AWS_AUDIO_PREFIX:
+            prefixes_to_try.append(f"{AWS_AUDIO_PREFIX.strip('/')}/{clean_folder}/")
+            prefixes_to_try.append(f"{AWS_AUDIO_PREFIX.strip('/')}/{clean_folder}")
+        prefixes_to_try.append(f"{clean_folder}/")
+    if AWS_AUDIO_PREFIX:
+        prefixes_to_try.append(f"{AWS_AUDIO_PREFIX.strip('/')}/")
+    prefixes_to_try.append("")
+
+    for prefix in prefixes_to_try:
+        params = {"Bucket": AWS_AUDIO_BUCKET}
+        if prefix:
+            params["Prefix"] = prefix
+        try:
+            for page in paginator.paginate(**params):
+                for obj in page.get("Contents", []):
+                    if obj.get("Size", 0) == 0:
+                        continue
+                    if latest_obj is None or obj["LastModified"] > latest_obj["LastModified"]:
+                        latest_obj = obj
+        except Exception as e:
+            print(f"[LIPSYNC] S3 list error for prefix '{prefix}': {e}")
+
+        if latest_obj:
+            print(f"🔍 [LIPSYNC] Found latest audio in S3 using prefix '{prefix}': {latest_obj['Key']}")
+            break
+
     if not latest_obj:
+        print(f"⚠️ [LIPSYNC] Warning: No audio objects found in S3 bucket '{AWS_AUDIO_BUCKET}'.")
         return None
+
     key = latest_obj["Key"]
     return {
         "key": key,
@@ -283,25 +305,21 @@ def poll_video(video_id: str, interval: int = 5, timeout: int = 600):
                     print(f"Poll error (attempt {poll_count}, elapsed={elapsed:.0f}s): {r.status_code} {r.text}")
                 if r.status_code == 404:
                     raise FileNotFoundError(f"Video {vid} not found (404).")
-                # If 401/403, we might want to rotate.
-                # Raising exception here triggers rotation in execute_tavus_with_retry
                 if r.status_code in (401, 403, 429):
                     r.raise_for_status()
             
             data = r.json()
             status = data.get("status")
             
-            # Show progress every 30 seconds or when status changes
             if status != last_status or poll_count == 1 or int(elapsed) % 30 == 0:
-                print(f"[poll #{poll_count}] status={status}, elapsed={elapsed:.0f}s/{to}s, video_id={vid[:10]}...")
+                print(f"⏳ [LIPSYNC-POLL #{poll_count}] status={status}, elapsed={elapsed:.0f}s/{to}s, video_id={vid[:10]}...")
                 last_status = status
             else:
-                # Brief progress indicator
-                if poll_count % 6 == 0:  # Every ~30 seconds with 5s interval
-                    print(f"[poll] Still {status}... ({elapsed:.0f}s elapsed)")
+                if poll_count % 6 == 0:
+                    print(f"⏳ [LIPSYNC-POLL] Still {status}... ({elapsed:.0f}s elapsed)")
             
             if status == "ready":
-                print(f"✅ Video ready after {elapsed:.0f}s and {poll_count} polls")
+                print(f"✅ [LIPSYNC] Tavus video generation ready after {elapsed:.0f}s and {poll_count} polls")
                 return data
             if status == "error":
                 error_msg = data.get("error_message", "No error message provided")
@@ -310,14 +328,6 @@ def poll_video(video_id: str, interval: int = 5, timeout: int = 600):
                 raise TimeoutError(f"Timed out waiting for Tavus video after {elapsed:.0f}s ({poll_count} polls). Last status: {status}")
             time.sleep(intr)
 
-    # Note: polling is a long running process. If we rotate key mid-poll, we restart polling.
-    # This is acceptable as long as the video ID is valid for all keys (which it should be if keys are for same account/replica)
-    # If keys are for DIFFERENT accounts, then video_id from key A won't work with key B.
-    # Assumption: User provides keys for the SAME account or keys that can access the same replica/videos.
-    # If keys are independent accounts, rotation during polling won't work for the *same* video ID.
-    # However, create_tavus_video rotation handles the initial creation.
-    # For polling, we'll assume the key that created it works, or if it fails (e.g. rate limit), another key *might* work 
-    # if they share access. If they don't share access, polling rotation is futile but harmless (will just fail again).
     return execute_tavus_with_retry(_do_poll, video_id, interval, timeout)
 
 
@@ -337,29 +347,35 @@ def generate_lipsync_video(
     audio_url: Optional[str] = None,
     video_filename: Optional[str] = None,
 ) -> Dict[str, object]:
-    """Generate a Tavus video for the latest audio in S3 and save it locally."""
+    """Generate a Tavus video for the latest audio in S3 and save it locally & upload to S3."""
     folder_name = target_folder.strip() or "default"
     videos_dir = COLLECTIONS_ROOT.joinpath(folder_name, "videos")
     videos_dir.mkdir(parents=True, exist_ok=True)
 
+    print(f"🎬 [LIPSYNC] Starting video generation pipeline for folder='{folder_name}'...")
     audio_info = None
     if audio_url:
+        print(f"🔊 [LIPSYNC] Using explicit S3 audio URL: {audio_url}")
         audio_info = {"url": audio_url, "key": None}
     else:
+        print(f"🔍 [LIPSYNC] Searching S3 for latest audio file in folder '{folder_name}'...")
         audio_info = get_latest_audio_from_s3(folder_name)
         if not audio_info:
             raise RuntimeError(
                 f"No learning TTS audio files were found in S3 for folder '{folder_name}'. "
-                "Ensure /api/learning-tts has uploaded audio to S3 before invoking lipsync."
+                "Ensure speech audio has been uploaded to S3 before invoking summary video generation."
             )
         audio_url = audio_info["url"]
+        print(f"🔊 [LIPSYNC] Retrieved latest S3 audio URL: {audio_url}")
 
     filename = video_filename or f"learning-video-{int(time.time())}.mp4"
+    print(f"⚡ [LIPSYNC] Creating Tavus lipsync video job (audio_url='{audio_url}', replica_id='{REPLICA_ID}')...")
     create_resp = create_tavus_video(audio_url, video_name=Path(filename).stem)
     video_id = create_resp.get("video_id") or create_resp.get("id")
     if not video_id:
         raise RuntimeError(f"No video_id returned by Tavus: {create_resp}")
 
+    print(f"⏳ [LIPSYNC] Tavus video job created with ID '{video_id}'. Polling status until complete...")
     video_data = poll_video(video_id, interval=5, timeout=600)
     download_url_field = (
         video_data.get("download_url")
@@ -367,21 +383,23 @@ def generate_lipsync_video(
         or video_data.get("result", {}).get("download_url")
     )
     if not download_url_field:
-        raise RuntimeError("Tavus response did not include a downloadable URL.")
+        raise RuntimeError("Tavus response did not include a downloadable video URL.")
 
     out_path = videos_dir / filename
+    print(f"📥 [LIPSYNC] Downloading synthesized video from Tavus to {out_path}...")
     download_url(download_url_field, out_path)
 
     # Upload to S3
     s3_video_info = None
     try:
+        print(f"☁️ [LIPSYNC] Uploading generated summary video to S3 bucket '{AWS_AUDIO_BUCKET}'...")
         s3_video_info = upload_video_to_s3(out_path, folder=folder_name)
-        print(f"✅ Video uploaded to S3: {s3_video_info['url']}")
+        print(f"✅ [LIPSYNC] Summary video successfully uploaded to S3: {s3_video_info['url']}")
     except Exception as e:
-        print(f"⚠️ Failed to upload video to S3: {e}")
+        print(f"⚠️ [LIPSYNC] Warning: Failed to upload video to S3: {e}")
 
     relative_path = out_path.relative_to(COLLECTIONS_ROOT).as_posix()
-    return {
+    result = {
         "video_path": str(out_path),
         "relative_path": relative_path,
         "video_filename": filename,
@@ -389,6 +407,8 @@ def generate_lipsync_video(
         "tavus": {"video_id": video_id, "raw": video_data},
         "s3_video": s3_video_info,
     }
+    print(f"🎉 [LIPSYNC] [SUCCESS] Summary video generated and ready: filename='{filename}', S3 URL='{s3_video_info['url'] if s3_video_info else relative_path}'")
+    return result
 
 
 # ---------------------------------------------------------------------------
