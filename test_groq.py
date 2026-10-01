@@ -1406,6 +1406,27 @@ def tutor_ping():
     return jsonify({"ok": True, "user_id": g.user_id})
 
 
+@app.route('/api/tutor/has-profile', methods=['GET'])
+@require_auth
+def tutor_has_profile():
+    """
+    Whether this user has ANY saved AI Tutor progress at all, across every
+    document - used by the homepage/navbar to decide "Continue Learning" vs
+    "Start Now"/"Get Started". That decision used to be based purely on
+    local browser state (a Clerk session or an anonymous id in
+    localStorage), so manually deleting a student's student_profiles
+    document in MongoDB had no visible effect - the button still said
+    "Continue Learning" because the browser was still identified, even
+    though there was nothing left to continue. This checks the actual
+    backend state instead, so deleting that data correctly sends the user
+    back through the auth-gate/onboarding flow.
+    """
+    if not client:
+        return jsonify({"hasProfile": False})
+    exists = student_profiles_collection.find_one({"user_id": g.user_id}, {"_id": 1}) is not None
+    return jsonify({"hasProfile": exists})
+
+
 @app.route('/api/tutor/progress', methods=['GET'])
 @require_auth
 def tutor_progress():
