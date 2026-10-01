@@ -1427,6 +1427,25 @@ def tutor_has_profile():
     return jsonify({"hasProfile": exists})
 
 
+@app.route('/api/tutor/profile', methods=['DELETE'])
+@require_auth
+def tutor_delete_profile():
+    """
+    Wipes every student_profiles document for this user (all documents,
+    not just one) - the "Delete Profile" action in the account menu. This
+    is the same effect as manually deleting the collection entry in
+    MongoDB, just reachable from the UI instead of requiring direct
+    database access. Does not touch the user's Clerk account or the
+    uploaded `files` themselves - only this user's diagnostic/plan/lesson
+    progress.
+    """
+    if not client:
+        return jsonify({"error": "Database connection is not available."}), 500
+    result = student_profiles_collection.delete_many({"user_id": g.user_id})
+    print(f"[TUTOR-PROFILE] Deleted {result.deleted_count} profile document(s) for user_id={g.user_id}")
+    return jsonify({"deletedCount": result.deleted_count})
+
+
 @app.route('/api/tutor/progress', methods=['GET'])
 @require_auth
 def tutor_progress():
