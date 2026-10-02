@@ -66,6 +66,14 @@ def _search_image_candidates(query: str, num: int) -> list:
         print(f"[INVALID KEY] Serper key '...{SERPER_API_KEY[-6:]}' was rejected ({resp.status_code}) - "
               f"it's likely invalid or expired. Replace SERPER_API_KEY in .env.")
         return []
+    if resp.status_code == 400:
+        # Confirmed cause on a free-plan key: the "(site:a OR site:b)" query
+        # pattern (fetch_topic_images' site-restricted search) is rejected
+        # on Serper's Images endpoint specifically - "Query pattern not
+        # allowed for free accounts". Not fatal: the caller falls back to a
+        # plain, unrestricted query next.
+        print(f"[TOPIC-IMAGES] [NOTICE] Serper rejected this image query (400: {resp.text[:150]}) for '{query}'.")
+        return []
     resp.raise_for_status()
     return [img["imageUrl"] for img in resp.json().get("images", []) if img.get("imageUrl")]
 
@@ -92,7 +100,22 @@ def fetch_topic_images(topic_title: str, limit: int = 4) -> list:
         over_fetch = max(limit * 3, limit + 6)
         query = f"{topic_title} educational diagram"
 
-        candidates = _search_image_candidates(site_restricted_query(query, domains), over_fetch)
+        # The site-restricted "(site:a OR site:b)" query is rejected outright
+        # by Serper's Images endpoint on a free-plan key ("Query pattern not
+        # allowed for free accounts", HTTP 400) even though the identical
+        # pattern works fine on their /search (web) endpoint - confirmed via
+        # a direct API call, which is why reference links worked but images
+        # never did. Isolated in its own try/except so that rejection just
+        # means "0 candidates from the restricted search" and execution
+        # still falls through to the plain query below, instead of the
+        # exception aborting fetch_topic_images entirely before the plain
+        # (working) query ever runs.
+        try:
+            candidates = _search_image_candidates(site_restricted_query(query, domains), over_fetch)
+        except Exception as e:
+            print(f"[TOPIC-IMAGES] [NOTICE] Site-restricted image search failed ({e}) - "
+                  f"falling back to a plain search for '{query}'.")
+            candidates = []
         if len(candidates) < over_fetch:
             seen = set(candidates)
             for url in _search_image_candidates(query, over_fetch):
