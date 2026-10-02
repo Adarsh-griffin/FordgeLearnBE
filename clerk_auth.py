@@ -155,8 +155,13 @@ def resolve_user_id_soft() -> str | None:
             user_id = payload.get("sub")
             if user_id:
                 return user_id
-        except Exception:
-            pass
+        except Exception as e:
+            # Previously silent - a real verification failure here (e.g. a
+            # CLERK_PUBLISHABLE_KEY mismatch between this backend and the
+            # frontend that issued the token) would otherwise look
+            # identical to "no identity provided at all", with nothing in
+            # the logs to tell them apart.
+            print(f"[AUTH] [WARNING] Soft Clerk token verification failed on {request.path}: {e}")
 
     anon_id = request.headers.get("X-Anonymous-Id", "").strip()
     if anon_id and _ANON_ID_RE.match(anon_id):
