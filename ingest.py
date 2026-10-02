@@ -458,6 +458,20 @@ def ingest_document(file_path, file_id=None):
     print(f"[INGEST] [OK] Subtopic tree stored in MongoDB successfully! (Collection: '{collection_name}')")
     print(f"[INGEST] [START] Document ingestion complete. Initiating summary generation & passmain background worker...\n")
 
+    # The PDF's full text (pages_text) and structure (page_index) are now
+    # durable in MongoDB - nothing downstream reads this local disk copy
+    # again (passmain_groq.py reads pages_text from Mongo, image_finder.py
+    # only uses file_path as a string key). Deleting it here is the only
+    # place that's safe to do so: this function is the sole reader of the
+    # actual file bytes, and we've just finished using them. Per the "nothing
+    # stored locally, only AWS/MongoDB" requirement - uploads/ would
+    # otherwise grow forever.
+    try:
+        os.remove(file_path)
+        print(f"[INGEST] Removed local upload copy: '{file_path}'")
+    except OSError as e:
+        print(f"[INGEST] [WARNING] Could not remove local upload copy '{file_path}': {e}")
+
     return {
         "status": "success",
         "collection_name": collection_name,

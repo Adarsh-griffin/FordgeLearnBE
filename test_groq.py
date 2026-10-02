@@ -823,32 +823,10 @@ def learning_tts():
             "model": model,
         }
 
-        # Ensure a per-PDF folder exists in the public TTS output folder and save files locally
-        try:
-            local_folder = os.path.join(TTS_OUTPUT_FOLDER, safe_folder)
-            os.makedirs(local_folder, exist_ok=True)
-
-            # save summary text locally
-            try:
-                summary_path = os.path.join(local_folder, 'summary.txt')
-                with open(summary_path, 'w', encoding='utf-8') as sf:
-                    sf.write(text)
-                print(f"[GCP-TTS] Wrote summary.txt to {summary_path}")
-            except Exception as e:
-                print(f"[GCP-TTS] Warning: failed to write summary.txt locally: {e}")
-
-            # save audio locally
-            local_audio_name = audio_meta['filename']
-            local_audio_path = os.path.join(local_folder, local_audio_name)
-            try:
-                with open(local_audio_path, 'wb') as af:
-                    af.write(audio_bytes)
-                print(f"[GCP-TTS] Wrote audio file locally to {local_audio_path}")
-            except Exception as e:
-                print(f"[GCP-TTS] Warning: failed to write audio file locally: {e}")
-        except Exception as e:
-            print(f"[GCP-TTS] Warning: failed to associate or save local files for audio: {e}")
-            local_audio_name = audio_meta['filename']
+        # Audio is already durable in MongoDB GridFS (above) and gets
+        # uploaded to S3 right below - no local disk copy, per the "nothing
+        # stored locally, only AWS/MongoDB" requirement.
+        local_audio_name = audio_meta['filename']
 
         # Upload audio to S3 so lipsync can fetch the latest file
         try:
@@ -889,8 +867,6 @@ def learning_tts():
         }
         if audio_meta.get("s3_url"):
             result["s3_url"] = audio_meta["s3_url"]
-        if 'local_audio_name' in locals() and 'safe_folder' in locals():
-            result["local_path"] = os.path.join(safe_folder, local_audio_name)
         if video_payload:
             result["video"] = video_payload
         print(f"[GCP-TTS] Returning response: {result}")
@@ -961,7 +937,9 @@ def qa_tts():
         except Exception as e:
             return jsonify({"error": "Failed to store QA TTS in GridFS", "details": str(e)}), 500
 
-        # Associate with file document (if available) and save local copy under per-PDF folder
+        # Associate with file document (if available). Audio itself lives in
+        # GridFS (above) and S3 (below) only - no local disk copy, per the
+        # "nothing stored locally, only AWS/MongoDB" requirement.
         file_name_req = (data or {}).get('fileName') or (data or {}).get('file_name')
         try:
             file_doc = None
@@ -970,23 +948,13 @@ def qa_tts():
             if not file_doc:
                 file_doc = files_collection.find_one({}, sort=[("uploadDate", -1)])
 
-            # per-pdf folder
+            # per-pdf folder (used as the S3 key prefix below)
             folder_basename = None
             if file_doc and file_doc.get('originalName'):
                 folder_basename = os.path.splitext(file_doc['originalName'])[0]
             else:
                 folder_basename = file_name_req or f"unnamed-qa-{int(datetime.utcnow().timestamp())}"
             safe_folder = secure_filename(folder_basename)
-            local_folder = os.path.join(TTS_OUTPUT_FOLDER, safe_folder)
-            os.makedirs(local_folder, exist_ok=True)
-
-            # save audio locally
-            local_audio_path = os.path.join(local_folder, target_name)
-            try:
-                with open(local_audio_path, 'wb') as af:
-                    af.write(audio_bytes)
-            except Exception as e:
-                print(f"[QA-TTS] Warning: failed to write QA audio locally: {e}")
 
             audio_meta = {
                 "type": "qa",
@@ -994,7 +962,6 @@ def qa_tts():
                 "filename": target_name,
                 "contentType": f"audio/{fmt}",
                 "created_at": datetime.utcnow(),
-                "local_path": os.path.join(safe_folder, target_name)
             }
 
             # This previously only ever went to GridFS - confirmed nothing
