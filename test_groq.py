@@ -166,12 +166,15 @@ app = Flask(__name__)
 # read the response. Set ALLOWED_ORIGINS in .env (comma-separated) for every
 # real frontend origin (prod + any preview deploys); defaults here cover
 # local dev only.
-ALLOWED_ORIGINS = [
+RAW_ALLOWED_ORIGINS = [
     o.strip() for o in os.getenv(
         "ALLOWED_ORIGINS",
         "http://localhost:5173,http://localhost:8080,http://127.0.0.1:5173"
     ).split(",") if o.strip()
 ]
+# Allow explicit env origins plus any Render frontend deployment domain
+ALLOWED_ORIGINS = RAW_ALLOWED_ORIGINS + [r"https://.*\.onrender\.com", r"http://.*\.onrender\.com"]
+
 CORS(
     app,
     resources={r"/*": {"origins": ALLOWED_ORIGINS}},

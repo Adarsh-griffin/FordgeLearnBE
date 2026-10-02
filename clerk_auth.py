@@ -44,7 +44,7 @@ from jwt import PyJWKClient
 load_dotenv(find_dotenv())
 
 CLERK_JWT_ISSUER = os.getenv("CLERK_JWT_ISSUER", "").rstrip("/")
-CLERK_PUBLISHABLE_KEY = os.getenv("CLERK_PUBLISHABLE_KEY", "").strip()
+CLERK_PUBLISHABLE_KEY = os.getenv("CLERK_PUBLISHABLE_KEY", "pk_test_YXdhaXRlZC1oYWdmaXNoLTgwMDMuY2xlcmsuYWNjb3VudHMuZGV2JA").strip()
 
 _jwks_client = None
 
