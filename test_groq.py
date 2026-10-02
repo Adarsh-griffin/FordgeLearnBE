@@ -50,7 +50,7 @@ from groq import Groq
 # Shared key-rotation/retry logic (was duplicated across ingest.py,
 # retrieval.py, passmain_groq.py and this file - see groq_client.py).
 from groq_client import get_client as get_current_groq_client, rotate_key, execute_with_retry
-from clerk_auth import require_auth
+from clerk_auth import require_auth, resolve_user_id_soft
 from knowledge_graph import extract_topic_graph
 from diagnostic import (
     topological_order,
@@ -327,9 +327,21 @@ def upload_file():
         # replaced (it used to re-open this local path long after upload
         # and fail once the file was gone).
         if client:
-            existing = files_collection.find_one({"originalName": file.filename})
+            # Scoped to the uploader (Clerk user or anonymous guest id, same
+            # identity scheme as the AI Tutor routes - see clerk_auth.py).
+            # Previously matched by originalName alone with no owner at all,
+            # so two different students uploading a same-named file (e.g.
+            # "resume.pdf") silently shared one document, and every file ever
+            # uploaded by anyone was visible to everyone via /api/files -
+            # confirmed as a real cross-user data leak (AI Tutor's "which
+            # document do you want to learn?" picker showed another
+            # student's resume). owner_id is None only when the request
+            # carries no identity at all (kept for backward compatibility -
+            # such uploads just won't show up for anyone via /api/files).
+            owner_id = resolve_user_id_soft()
+            existing = files_collection.find_one({"originalName": file.filename, "owner_id": owner_id})
             if existing:
-                print(f"File '{file.filename}' already exists in DB. Skipping metadata insert.")
+                print(f"File '{file.filename}' already exists in DB for this owner. Skipping metadata insert.")
                 file_id = str(existing["_id"])
             else:
                 metadata = {
@@ -337,7 +349,8 @@ def upload_file():
                     "filePath": filepath,
                     "fileType": file.content_type,
                     "fileSize": os.path.getsize(filepath),
-                    "uploadDate": datetime.utcnow()
+                    "uploadDate": datetime.utcnow(),
+                    "owner_id": owner_id,
                 }
                 inserted = files_collection.insert_one(metadata)
                 file_id = str(inserted.inserted_id)
@@ -451,9 +464,20 @@ def get_files():
         # over from failed upload insertions or old test runs - these used
         # to be returned as-is, risking a frontend TypeError anywhere that
         # assumes originalName is always a string (e.g. .endsWith(), .split()).
+        #
+        # Scoped to the requesting student's identity (owner_id, set at
+        # upload time - see /api/upload). This used to return every file
+        # ever uploaded by anyone with no filter at all - confirmed as a
+        # real cross-user leak (the AI Tutor document picker showed another
+        # student's resume). No identity header at all -> empty list rather
+        # than falling back to "everyone's files", so the fail-safe default
+        # is private, not public.
+        owner_id = resolve_user_id_soft()
+        if not owner_id:
+            return jsonify([])
         docs = list(
             files_collection.find(
-                {"originalName": {"$ne": None}},
+                {"originalName": {"$ne": None}, "owner_id": owner_id},
                 {"originalName": 1, "uploadDate": 1, "fileSize": 1, "folder": 1}
             ).sort("uploadDate", -1)
         )
@@ -1505,6 +1529,51 @@ def get_or_build_topic_graph(file_doc):
     return topic_graph
 
 
+def resolve_file_and_topic_graph(file_id, max_wait_seconds=20, poll_interval=2):
+    """Shared by /api/tutor/topics, /api/tutor/diagnostic/start, and
+    /api/tutor/plan/generate: resolves the file doc and its topic graph,
+    polling briefly if ingestion hasn't finished yet.
+
+    ingest.py runs as a separate subprocess kicked off by /api/upload - a
+    student who picks their goal/time faster than that subprocess finishes
+    (confirmed happening: PageIndex Cloud API / topic-curriculum generation
+    can easily take longer than the few seconds onboarding takes) used to
+    hit an immediate 409 here with no retry, which the frontend could only
+    recover from via a manual "Try again" click. Polling a few times before
+    giving up covers the common case transparently; bails out immediately
+    (no need to wait out the full window) if passmain_groq.py has already
+    marked the document "failed", since no amount of waiting fixes that.
+
+    Returns (file_doc, topic_graph, error_response); error_response is None
+    on success, otherwise a (jsonify(...), status_code) tuple to return as-is.
+    """
+    file_doc = resolve_file_by_id(file_id)
+    if not file_doc:
+        return None, None, (jsonify({"error": "File not found"}), 404)
+
+    waited = 0
+    while True:
+        if file_doc.get("status") == "failed":
+            return file_doc, None, (jsonify({
+                "error": file_doc.get("error") or "Document processing failed.",
+                "status": "failed",
+            }), 409)
+
+        topic_graph = get_or_build_topic_graph(file_doc)
+        if topic_graph is not None:
+            return file_doc, topic_graph, None
+
+        if waited >= max_wait_seconds:
+            return file_doc, None, (jsonify({
+                "error": "This document has no page_index yet - it may still be ingesting, or ingestion failed.",
+                "status": "processing",
+            }), 409)
+
+        time.sleep(poll_interval)
+        waited += poll_interval
+        file_doc = resolve_file_by_id(file_id)  # re-fetch - ingest.py writes page_index in a separate process
+
+
 def get_or_fetch_topic_images(file_doc, topic):
     """
     Cached per-DOCUMENT, per-topic (not per-student - every student
@@ -1547,15 +1616,9 @@ def tutor_topics():
     if not file_id:
         return jsonify({"error": "fileId query parameter is required"}), 400
 
-    file_doc = resolve_file_by_id(file_id)
-    if not file_doc:
-        return jsonify({"error": "File not found"}), 404
-
-    topic_graph = get_or_build_topic_graph(file_doc)
-    if topic_graph is None:
-        return jsonify({
-            "error": "This document has no page_index yet - it may still be ingesting, or ingestion failed."
-        }), 409
+    file_doc, topic_graph, error = resolve_file_and_topic_graph(file_id)
+    if error:
+        return error
 
     return jsonify(topic_graph)
 
@@ -1621,15 +1684,9 @@ def diagnostic_start():
     if not file_id:
         return jsonify({"error": "fileId is required"}), 400
 
-    file_doc = resolve_file_by_id(file_id)
-    if not file_doc:
-        return jsonify({"error": "File not found"}), 404
-
-    topic_graph = get_or_build_topic_graph(file_doc)
-    if topic_graph is None:
-        return jsonify({
-            "error": "This document has no page_index yet - it may still be ingesting, or ingestion failed."
-        }), 409
+    file_doc, topic_graph, error = resolve_file_and_topic_graph(file_id)
+    if error:
+        return error
 
     topics = topic_graph.get("topics", [])
     if not topics:
@@ -1816,15 +1873,9 @@ def tutor_plan_generate():
     except (TypeError, ValueError):
         return jsonify({"error": "availableMinutes must be a positive number"}), 400
 
-    file_doc = resolve_file_by_id(file_id)
-    if not file_doc:
-        return jsonify({"error": "File not found"}), 404
-
-    topic_graph = get_or_build_topic_graph(file_doc)
-    if topic_graph is None:
-        return jsonify({
-            "error": "This document has no page_index yet - it may still be ingesting, or ingestion failed."
-        }), 409
+    file_doc, topic_graph, error = resolve_file_and_topic_graph(file_id)
+    if error:
+        return error
 
     topics = topic_graph.get("topics", [])
     if not topics:

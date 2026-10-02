@@ -138,3 +138,28 @@ def require_auth(f):
         }), 401
 
     return wrapper
+
+
+def resolve_user_id_soft() -> str | None:
+    """Same identity resolution as @require_auth (Clerk bearer token, else
+    X-Anonymous-Id), but never rejects the request - returns None if neither
+    is present/valid. For routes that aren't gated behind sign-in (upload,
+    file listing) but still need to know *whose* data this is, so one
+    student's uploads are never shown to another (see /api/upload and
+    /api/files in test_groq.py)."""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+        try:
+            payload = verify_clerk_token(token)
+            user_id = payload.get("sub")
+            if user_id:
+                return user_id
+        except Exception:
+            pass
+
+    anon_id = request.headers.get("X-Anonymous-Id", "").strip()
+    if anon_id and _ANON_ID_RE.match(anon_id):
+        return f"anon:{anon_id}"
+
+    return None
