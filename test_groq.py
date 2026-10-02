@@ -21,7 +21,8 @@ from groq import Groq, GroqError
 from pathlib import Path
 # from faster_whisper import WhisperModel  # Local STT disabled; using Groq hosted Whisper
 from dotenv import load_dotenv, find_dotenv
-from lipsync import generate_lipsync_video, upload_audio_to_s3
+from lipsync import upload_audio_to_s3
+# from lipsync import generate_lipsync_video  # Tavus video generation disabled by user request
 from gcp_tts import synthesize_speech as gcp_synthesize_speech, GOOGLE_TTS_VOICE_NAME
 TTS_OUTPUT_FOLDER = "path/to/your/static/collections"
 
@@ -891,40 +892,9 @@ def learning_tts():
         except Exception as e:
             print(f"[GCP-TTS] Warning: failed to write audio metadata to MongoDB: {e}")
 
+        # Tavus video generation pipeline commented out per user request
         video_payload = None
-        try:
-            print(f"🎬 [GCP-TTS] Triggering auto lipsync video generation for folder='{safe_folder}' using S3 audio_url='{s3_upload['url']}'...")
-            lipsync_result = generate_lipsync_video(target_folder=safe_folder, audio_url=s3_upload["url"])
-            s3_video = lipsync_result.get("s3_video")
-            video_url = s3_video["url"] if s3_video else build_collection_url(lipsync_result["relative_path"])
-            video_payload = {
-                "video_url": video_url,
-                "video_filename": lipsync_result.get("video_filename"),
-                "audio_key": (lipsync_result.get("audio") or {}).get("key"),
-                "audio_url": (lipsync_result.get("audio") or {}).get("url") or s3_upload["url"],
-            }
-            print(f"🎉 [GCP-TTS] Auto lipsync summary video generated & stored successfully! Video URL: {video_url}")
-            
-            # Save video metadata to MongoDB
-            try:
-                if file_doc:
-                    video_meta = video_payload.copy()
-                    video_meta["created_at"] = datetime.utcnow()
-                    video_meta["relative_path"] = lipsync_result.get("relative_path")
-                    
-                    files_collection.update_one(
-                        {"_id": file_doc["_id"]}, 
-                        {"$push": {"videos": video_meta}}
-                    )
-                    print(f"💾 [GCP-TTS] Saved video metadata to MongoDB for folder '{safe_folder}'")
-            except Exception as e:
-                print(f"[GCP-TTS] Warning: failed to save video metadata to MongoDB: {e}")
-
-        except Exception as e:
-            print(f"❌ [GCP-TTS] Warning: auto lipsync video generation failed: {e}")
-            import traceback
-            traceback.print_exc()
-            video_payload = {"error": str(e)}
+        print(f"🎬 [GCP-TTS] Tavus video generation skipped (disabled by user request). Summary audio ready.")
 
         # Return both audioId and audio_url for frontend compatibility
         audio_url = f"/api/tts-audio/{gridfs_id}"
@@ -1222,97 +1192,11 @@ def qa_voice():
 @app.route('/api/lipsync/generate', methods=['POST'])
 @limiter.limit("5 per minute")
 def generate_lipsync_video_endpoint():
-    if not client:
-        return jsonify({"error": "Database connection is not available."}), 500
-    data = request.get_json(silent=True) or {}
-    file_name_req = data.get('fileName') or data.get('file_name')
-    audio_url_req = data.get('audioUrl') or data.get('audio_url')
-    file_doc, safe_folder = resolve_file_context(file_name_req)
-
-    # If no audio_url was explicitly passed, search file_doc or synthesize summary audio on demand
-    if not audio_url_req and file_doc:
-        audios = file_doc.get("audios") or []
-        if audios and isinstance(audios, list) and audios[-1].get("s3_url"):
-            audio_url_req = audios[-1]["s3_url"]
-        elif file_doc.get("explanation"):
-            try:
-                explanations = file_doc.get("explanation")
-                if isinstance(explanations, list):
-                    summary_text = " ".join(item.get("explanation", "") for item in explanations if isinstance(item, dict))
-                else:
-                    summary_text = str(explanations)
-                if summary_text.strip():
-                    print(f"🔊 [LIPSYNC-GENERATE] Synthesizing summary audio on demand for document '{safe_folder}' using GCP TTS...")
-                    audio_bytes = gcp_synthesize_speech(summary_text[:3500])
-                    timestamp = int(time.time())
-                    filename = f"summary-{timestamp}.wav"
-                    s3_info = upload_audio_to_s3(audio_bytes, filename, folder=safe_folder)
-                    audio_url_req = s3_info["url"]
-                    files_collection.update_one({"_id": file_doc["_id"]}, {"$push": {"audios": {"s3_url": audio_url_req, "filename": filename, "created_at": datetime.utcnow()}}})
-                    print(f"✅ [LIPSYNC-GENERATE] Uploaded summary audio to S3: {audio_url_req}")
-            except Exception as exc:
-                print(f"⚠️ [LIPSYNC-GENERATE] Warning: On-demand audio synthesis failed: {exc}")
-
-    def _run_generation_in_background(file_doc, file_name_req, safe_folder, audio_url_req):
-        """Does the actual (slow - Tavus polling can take up to 5 minutes)
-        video generation + MongoDB save, off the request thread. Runs in a
-        background thread rather than blocking the Flask worker that's
-        handling the HTTP request, which used to hold that worker (and any
-        reverse proxy in front of it, e.g. Render/Cloudflare, which time out
-        around 30-60s) for the ENTIRE duration - guaranteeing a 504 on every
-        real deployment. The frontend now polls the existing
-        /api/lipsync/latest endpoint instead of waiting on this response."""
-        try:
-            print(f"🎬 [LIPSYNC-BG] Summary video generation started for folder='{safe_folder}', audio_url='{audio_url_req}'")
-            result = generate_lipsync_video(target_folder=safe_folder, audio_url=audio_url_req)
-            print(f"🎉 [LIPSYNC-BG] Summary video successfully generated: {result.get('video_filename')}")
-        except Exception as exc:
-            print(f"❌ [LIPSYNC-BG] Summary video generation failed: {exc}")
-            import traceback
-            traceback.print_exc()
-            return
-
-        s3_video = result.get("s3_video")
-        final_video_url = s3_video["url"] if s3_video else build_collection_url(result.get("relative_path"))
-
-        video_meta = {
-            "filename": result.get("video_filename"),
-            "relative_path": result.get("relative_path"),
-            "created_at": datetime.utcnow(),
-            "source_audio_key": (result.get("audio") or {}).get("key"),
-            "source_audio_url": (result.get("audio") or {}).get("url") or audio_url_req,
-            "tavus_video_id": (result.get("tavus") or {}).get("video_id"),
-            "video_url": final_video_url,
-        }
-
-        if file_doc:
-            files_collection.update_one({"_id": file_doc["_id"]}, {"$set": {"folder": safe_folder}})
-            files_collection.update_one({"_id": file_doc["_id"]}, {"$push": {"videos": video_meta}})
-            print(f"💾 [LIPSYNC-BG] Saved video metadata to MongoDB for document _id={file_doc['_id']}")
-        else:
-            files_collection.insert_one({
-                "originalName": file_name_req or f"unnamed-video-{int(datetime.utcnow().timestamp())}",
-                "uploadDate": datetime.utcnow(),
-                "folder": safe_folder,
-                "videos": [video_meta]
-            })
-
-    threading.Thread(
-        target=_run_generation_in_background,
-        args=(file_doc, file_name_req, safe_folder, audio_url_req),
-        daemon=True,
-    ).start()
-
-    # 202 Accepted: generation is running in the background. The frontend
-    # polls GET /api/lipsync/latest?fileName=... (already-existing endpoint,
-    # already wired on the frontend's auto-refresh poll) until a video with
-    # a created_at newer than this request shows up.
+    # Tavus lipsync video generation disabled per user request
     return jsonify({
-        "status": "generating",
-        "folder": safe_folder,
-        "message": "Video generation started - poll /api/lipsync/latest for the result.",
-        "requested_at": serialize_datetime(datetime.utcnow()),
-    }), 202
+        "status": "disabled",
+        "message": "Tavus video generation pipeline is disabled."
+    }), 200
 
 
 @app.route('/api/lipsync/latest', methods=['GET'])
