@@ -13,6 +13,7 @@ boto3
 gunicorn
 requests
 pyjwt[crypto]
+gtts
 
 # ==========================================
 # PIPELINE 1: Vectorless RAG (Active for Render 500MB Free Tier)

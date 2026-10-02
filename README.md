@@ -1,122 +1,94 @@
-# LearnBack - Backend Service (NeuroLearn Platform)
+# LearnForge Backend (`LearnBack`)
 
-This is the Flask backend service for **NeuroLearn**, an end-to-end multi-modal AI tutoring platform. It powers document ingestion, **Vectorless PageIndex RAG**, Groq LLM reasoning, Text-to-Speech (Fal.ai/PlayAI), Tavus AI avatar lipsync video generation, and automated student assessments.
-
----
-
-## 🚀 Quick Startup Guide
-
-### Prerequisites
-Make sure you have installed on your machine:
-* **Python**: v3.10+ recommended (Tested on Python 3.13)
-* **MongoDB**: Running locally on `mongodb://localhost:27017/` (or MongoDB Atlas connection string)
-* **Git**
+This is the Flask + Python backend API server for **LearnForge**, powering document ingestion, RAG retrieval, LLaMA 3 LLM inference via Groq, GCP summary speech synthesis, AWS S3 audio management, and Serper web scraping.
 
 ---
 
-### Step 1: Clone & Navigate
-```bash
-git clone <your-repository-url>
-cd LearnBack
-```
+## 🔗 Repositories
+
+- **Frontend Repository (`LearnFront`)**: [https://github.com/Adarsh-griffin/FodgeLearnFront.git](https://github.com/Adarsh-griffin/FodgeLearnFront.git)
+- **Backend Repository (`LearnBack`)**: [https://github.com/Adarsh-griffin/FordgeLearnBE.git](https://github.com/Adarsh-griffin/FordgeLearnBE.git)
 
 ---
 
-### Step 2: Create & Activate Virtual Environment
+## 🛠️ Tech Stack
 
-* **PowerShell (Windows):**
-  ```powershell
-  python -m venv .venv
-  .\.venv\Scripts\Activate.ps1
-  ```
-* **Command Prompt (CMD - Windows):**
-  ```cmd
-  python -m venv .venv
-  .\.venv\Scripts\activate.bat
-  ```
-* **macOS / Linux / Git Bash:**
-  ```bash
-  python3 -m venv .venv
-  source .venv/bin/activate
-  ```
+- **Python 3.11+ & Flask**: Lightweight, scalable REST API web framework.
+- **Groq API**: High-speed LLaMA 3 8B / 70B LLM inference and Whisper speech-to-text (STT).
+- **MongoDB & GridFS (PyMongo)**: Storage for user profiles, document content, and audio GridFS metadata.
+- **PageIndex Vectorless Retriever**: Semantic context extraction and document retrieval.
+- **GCP Text-to-Speech / gTTS**: High-quality studio speech synthesis with fallback support.
+- **AWS S3 Storage**: Cloud storage for generated TTS audio files.
+- **Serper Web Scraping API**: Search engine integration for real-world educational reference links.
 
 ---
 
-### Step 3: Install Dependencies
-```bash
-pip install -r requirement.txt
-```
+## ⚙️ Environment Setup
 
----
-
-### Step 4: Environment Variables Setup (`.env`)
-Create or update the `.env` file in the `LearnBack` folder with your API keys:
+Create a `.env` file in the root of `LearnBack/`:
 
 ```env
-# Groq API Keys (Supports single or comma-separated keys for auto rotation)
-GROQ_API_KEY=gsk_your_groq_api_key_here
+# Groq API Keys (comma-separated for multi-key rotation)
+GROQ_API_KEYS=your_groq_api_key_1,your_groq_api_key_2
 
-# PageIndex API Key (Optional fallback to Groq key)
-PAGEINDEX_API_KEY=pageindex_demo_key
+# PageIndex API Key
+PAGEINDEX_API_KEY=your_pageindex_api_key
 
-# TTS & Video Generation APIs
-FAL_API_KEY=your_fal_ai_key
-FAL_KOKORO_URL=https://api.fal.ai/kokoro/tts
-TAVUS_API_KEY=your_tavus_api_key
-REPLICA_ID=r9fa0878977a
+# Serper API Key
+SERPER_API_KEY=your_serper_api_key
 
-# AWS S3 (For audio hosting)
-AWS_ACCESS_KEY_ID=your_aws_key
-AWS_SECRET_ACCESS_KEY=your_aws_secret
+# MongoDB Connection String & Target Database
+MONGO_URI=mongodb+srv://user:password@cluster.mongodb.net/
+MONGO_DB_NAME=LearnFodge
+
+# AWS Credentials & S3 Bucket
+AWS_ACCESS_KEY_ID=your_aws_access_key
+AWS_SECRET_ACCESS_KEY=your_aws_secret_key
 AWS_REGION=ap-southeast-2
-AWS_AUDIO_BUCKET=your-bucket-name
+AWS_S3_BUCKET=your_s3_bucket_name
 
-# MongoDB Database
-MONGODB_URI=mongodb://localhost:27017/
-MONGO_DB_NAME=neurolearn
+# Clerk Publishable Key (matches frontend)
+CLERK_PUBLISHABLE_KEY=pk_test_...
+
+# Allowed Frontend Origins (comma-separated)
+ALLOWED_ORIGINS=http://localhost:5173,http://localhost:8080
 ```
 
 ---
 
-### Step 5: Start the Backend Server
+## 🚀 Installation & Running Locally
 
-* **Development Mode:**
-  ```bash
-  python test_groq.py
-  ```
-  *The server will start at `http://127.0.0.1:5000`.*
+1. **Create and Activate Virtual Environment**:
+   ```bash
+   # Windows (PowerShell)
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
 
-* **Production Mode (Gunicorn / Render):**
-  ```bash
-  gunicorn test_groq:app
-  ```
+   # macOS / Linux
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
 
----
+2. **Install Python Dependencies**:
+   ```bash
+   pip install -r requirement.txt
+   ```
 
-## 📄 Command-Line Document Ingestion (Manual Testing)
-
-To manually ingest a PDF textbook/paper from the command line:
-```bash
-python ingest.py "path/to/your/document.pdf"
-```
-
----
-
-## 🔀 RAG Architecture Toggling (Vectorless vs. Traditional)
-
-By default, the application runs **Vectorless RAG (PageIndex)** which uses < 80 MB RAM, making it 100% compatible with Render's 500 MB Free Tier.
-
-If you ever want to switch to **Traditional Vector RAG (Qdrant + PyTorch)**, see the complete guide in [PIPELINE_TOGGLE_GUIDE.md](file:///d:/my%20projects/NeuroLearn/LearnForge/LearnBack/PIPELINE_TOGGLE_GUIDE.md).
+3. **Start the Flask Backend Server**:
+   ```bash
+   python test_groq.py
+   ```
+   The API server will run on `http://127.0.0.1:5000`.
 
 ---
 
-## 📡 Core API Endpoints
+## 🌐 API Endpoints Overview
 
-| Endpoint | Method | Description |
-| :--- | :--- | :--- |
-| `/api/upload` | `POST` | Uploads PDF and triggers automatic Vectorless PageIndex ingestion. |
-| `/api/qa` | `POST` | Answers student questions using PageIndex reasoning + Groq with page citations. |
-| `/api/qa-voice` | `POST` | Handles voice transcript queries. |
-| `/api/lipsync/generate` | `POST` | Generates Tavus AI Avatar video lecture for a summary. |
-| `/api/assessment/generate` | `GET` | Generates chapter MCQs or theoretical questions. |
-| `/api/assessment/submit` | `POST` | Grades student responses with page-specific study pointers. |
+- `POST /api/upload`: Upload PDF or input topic name to start ingestion.
+- `GET /api/processing-status/<file>`: Check status of document processing.
+- `GET /api/files`: Get list of uploaded documents.
+- `POST /api/qa`: Query the AI Tutor using document RAG context.
+- `POST /api/learning-tts`: Generate summary speech audio (GCP TTS / S3 storage).
+- `GET /api/tts-audio/<id>`: Stream TTS audio bytes from MongoDB GridFS.
+- `GET /api/get_links`: Get web-scraped educational reference links.
+- `GET /api/tutor/has-profile`: Check user profile status.

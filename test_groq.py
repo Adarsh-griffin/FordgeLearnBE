@@ -203,24 +203,6 @@ limiter = Limiter(
 import time
 from flask import g
 
-@app.before_request
-def log_request_start():
-    g.start_time = time.time()
-    origin = request.headers.get('Origin', 'Direct/Same-Origin')
-    print(f"\n[FE-BE CONNECT] Inbound {request.method} request to '{request.path}' from Origin: {origin} (IP: {request.remote_addr})")
-    try:
-        if request.is_json and request.json:
-            keys = list(request.json.keys())
-            print(f"[FE-BE CONNECT] Payload keys: {keys}")
-    except Exception:
-        pass
-
-@app.after_request
-def log_request_end(response):
-    duration = round(time.time() - getattr(g, 'start_time', time.time()), 3)
-    print(f"[FE-BE CONNECT] Outbound response {request.method} '{request.path}' -> Status {response.status_code} (Duration: {duration}s)\n")
-    return response
-
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Explicit health check endpoint for frontend connection status."""
@@ -1440,6 +1422,33 @@ def tutor_has_profile():
         return jsonify({"hasProfile": False})
     exists = student_profiles_collection.find_one({"user_id": g.user_id}, {"_id": 1}) is not None
     return jsonify({"hasProfile": exists})
+
+
+@app.route('/api/tutor/latest-file', methods=['GET'])
+@require_auth
+def tutor_latest_file():
+    """Returns the file_id/fileName of this user's most recently active AI
+    Tutor session (by student_profiles.updated_at), so the AI Tutor tab can
+    resume on page load/revisit without a locally-cached file pointer -
+    MongoDB is the only place this is remembered now, not localStorage."""
+    if not client:
+        return jsonify({"fileId": None, "fileName": None})
+    profile = student_profiles_collection.find_one(
+        {"user_id": g.user_id},
+        sort=[("updated_at", -1)],
+    )
+    if not profile:
+        return jsonify({"fileId": None, "fileName": None})
+    file_id = profile.get("file_id")
+    file_name = None
+    if file_id:
+        try:
+            from bson import ObjectId
+            file_doc = files_collection.find_one({"_id": ObjectId(file_id)}, {"originalName": 1})
+            file_name = file_doc.get("originalName") if file_doc else None
+        except Exception:
+            file_name = None
+    return jsonify({"fileId": file_id, "fileName": file_name})
 
 
 @app.route('/api/tutor/profile', methods=['DELETE'])
