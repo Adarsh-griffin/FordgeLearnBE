@@ -7,6 +7,7 @@ import time
 import requests
 from pypdf import PdfReader
 from pymongo import MongoClient
+from bson import ObjectId
 from dotenv import load_dotenv, find_dotenv
 # Shared key-rotation/retry client (was a duplicated single-key copy here -
 # see groq_client.py). Behavior preserved: this module still just grabs
@@ -359,7 +360,7 @@ so they are not real page numbers).
             }]
         }
 
-def ingest_document(file_path):
+def ingest_document(file_path, file_id=None):
     """
     Smart Combined PageIndex Architecture (SDK + API):
     1. Check PDF for native Table of Contents (TOC).
@@ -427,18 +428,32 @@ def ingest_document(file_path):
         "ingested_at": os.getenv("INGEST_TIMESTAMP", "2026-09-28")
     }
 
-    files_col.update_one(
-        {"filePath": file_path},
-        {"$set": doc_payload},
-        upsert=True
-    )
-
-    # Fallback update by originalName
-    files_col.update_one(
-        {"originalName": base_filename},
-        {"$set": doc_payload},
-        upsert=True
-    )
+    # Update by the exact document _id when known (passed from test_groq.py's
+    # /api/upload, which already created this document) - matching by _id is
+    # unambiguous, unlike the string-matching this replaced. The old code
+    # matched by filePath (the SANITIZED local disk path - fine) and then,
+    # as a "fallback", matched by originalName against base_filename, which
+    # is ALSO the sanitized name (derived from the sanitized file_path, via
+    # secure_filename() in /api/upload). For any filename secure_filename()
+    # changes (most commonly: spaces -> underscores), that fallback's query
+    # never matched the real document (whose originalName keeps the
+    # UNSANITIZED name), so upsert=True silently created a second, ghost
+    # document with the sanitized originalName instead of updating the real
+    # one. passmain_groq.py later writes the `explanation` field onto the
+    # REAL document (it updates by _id), so the ghost document - the one the
+    # frontend's polling actually finds, since it polls by this same
+    # sanitized name - never gets an explanation and "Processing..." never
+    # resolves. (See /api/upload and /api/processing-status in test_groq.py.)
+    if file_id:
+        result = files_col.update_one(
+            {"_id": ObjectId(file_id)},
+            {"$set": doc_payload},
+        )
+        if result.matched_count == 0:
+            print(f"[INGEST] [WARNING] No document matched _id={file_id} - falling back to filePath match.")
+            files_col.update_one({"filePath": file_path}, {"$set": doc_payload}, upsert=True)
+    else:
+        files_col.update_one({"filePath": file_path}, {"$set": doc_payload}, upsert=True)
 
     print(f"[INGEST] [OK] Subtopic tree stored in MongoDB successfully! (Collection: '{collection_name}')")
     print(f"[INGEST] [START] Document ingestion complete. Initiating summary generation & passmain background worker...\n")
@@ -452,6 +467,7 @@ def ingest_document(file_path):
 
 if __name__ == '__main__':
     if len(sys.argv) > 1:
-        ingest_document(sys.argv[1])
+        file_id_arg = sys.argv[2] if len(sys.argv) > 2 else None
+        ingest_document(sys.argv[1], file_id_arg)
     else:
-        print("Usage: python ingest.py <path_to_your_file.pdf>")
+        print("Usage: python ingest.py <path_to_your_file.pdf> [file_id]")

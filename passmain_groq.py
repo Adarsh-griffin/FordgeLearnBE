@@ -92,6 +92,25 @@ def save_explanation_to_mongo(doc_id, explanation):
     else:
         print(f"[PASSMAIN] [WARNING] No document matched _id={doc_id} when saving the explanation (deleted since?).")
 
+
+def save_failure_status_to_mongo(doc_id, error_message):
+    """Marks the document as failed instead of leaving it silently stuck at
+    status: "processing" forever - every early-return failure path below
+    used to just exit without touching MongoDB at all, so a genuine
+    ingestion failure (ingest.py crashed, PageIndex timed out, empty PDF
+    text, ...) looked IDENTICAL to "still working on it" from the frontend's
+    perspective: /api/processing-status only ever distinguished "has an
+    explanation" (completed) from "doesn't yet" (processing), with no way to
+    tell those two situations apart."""
+    try:
+        collection.update_one(
+            {"_id": doc_id},
+            {"$set": {"status": "failed", "error": error_message}}
+        )
+        print(f"[PASSMAIN] Marked document _id={doc_id} as failed: {error_message}")
+    except Exception as e:
+        print(f"[PASSMAIN] [WARNING] Could not mark document _id={doc_id} as failed: {e}")
+
 def process_file():
     print("\n[PASSMAIN] =========== [START] Processing Document Summary & Explanations ===========")
 
@@ -129,13 +148,17 @@ def process_file():
     pdf_path = file_doc.get("filePath", "")
     pages_text = file_doc.get("pages_text") or []
     if not pages_text:
-        print(f"[PASSMAIN] [ERROR] No pages_text appeared in MongoDB for '{pdf_path}' after waiting {max_wait_seconds}s - ingestion likely failed.")
+        error_message = f"No pages_text appeared in MongoDB after waiting {max_wait_seconds}s - ingestion likely failed."
+        print(f"[PASSMAIN] [ERROR] {error_message} ('{pdf_path}')")
+        save_failure_status_to_mongo(file_doc["_id"], error_message)
         return
     print(f"[PASSMAIN] Using {len(pages_text)} page(s) of text already stored in MongoDB for '{pdf_path}' (waited {waited}s)")
 
     pdf_text = "\n".join(p.get("text", "") for p in pages_text)
     if not pdf_text.strip():
-        print("[PASSMAIN] [ERROR] Stored pages_text was empty for this document.")
+        error_message = "Stored pages_text was empty for this document."
+        print(f"[PASSMAIN] [ERROR] {error_message}")
+        save_failure_status_to_mongo(file_doc["_id"], error_message)
         return
 
     chunks = split_text_into_chunks(pdf_text, chunk_size=3000, chunk_overlap=200)
@@ -215,7 +238,25 @@ def process_file():
         print(f"[PASSMAIN] Warning: Auto summary audio/video generation failed: {exc}")
 
 if __name__ == '__main__':
-    process_file()
+    # Any uncaught exception here used to crash this subprocess silently -
+    # the document stayed at status: "processing" forever with nothing in
+    # MongoDB to tell the frontend (or a human debugging it) that this run
+    # actually died, vs. was still genuinely working.
+    try:
+        process_file()
+    except Exception as exc:
+        print(f"[PASSMAIN] [FATAL] Unhandled exception during processing: {exc}")
+        import traceback
+        traceback.print_exc()
+        target_id = sys.argv[1] if len(sys.argv) > 1 else None
+        if target_id:
+            try:
+                collection.update_one(
+                    {"_id": ObjectId(target_id)},
+                    {"$set": {"status": "failed", "error": str(exc)}}
+                )
+            except Exception:
+                pass
 
 
 # ==============================================================================

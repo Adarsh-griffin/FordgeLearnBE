@@ -3,6 +3,7 @@ import textwrap
 import re
 import sys
 import subprocess
+import threading
 from datetime import datetime
 import json
 import requests
@@ -155,11 +156,44 @@ app = Flask(__name__)
 # allow_headers set explicitly so the AI Tutor's Authorization/X-Anonymous-Id
 # headers aren't stripped by the CORS preflight (default only reflects a
 # smaller safelist).
+#
+# origins is an explicit allowlist, NOT "*" - combining a wildcard origin
+# with supports_credentials=True makes Flask-CORS reflect whatever Origin
+# header the REQUEST sent back as Access-Control-Allow-Origin (since a
+# literal "*" is not legal alongside credentials per the CORS spec), which
+# means ANY website can make authenticated/cookied requests to this API and
+# read the response. Set ALLOWED_ORIGINS in .env (comma-separated) for every
+# real frontend origin (prod + any preview deploys); defaults here cover
+# local dev only.
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv(
+        "ALLOWED_ORIGINS",
+        "http://localhost:5173,http://localhost:8080,http://127.0.0.1:5173"
+    ).split(",") if o.strip()
+]
 CORS(
     app,
-    resources={r"/*": {"origins": "*"}},
+    resources={r"/*": {"origins": ALLOWED_ORIGINS}},
     supports_credentials=True,
     allow_headers=["Content-Type", "Authorization", "X-Anonymous-Id"],
+)
+
+# Per-IP rate limiting on the cost-intensive endpoints (upload, LLM Q&A,
+# assessment generation, TTS, video generation) - these are intentionally
+# reachable without signing in (guest mode is a deliberate product feature,
+# not an oversight), so request volume is bounded this way instead, to stop
+# a scripted loop from exhausting paid Groq/GCP TTS/Tavus/Fal.ai quotas.
+# In-memory storage (no Redis configured) - resets per worker process, which
+# is a weaker bound under multi-worker gunicorn than a shared store would
+# be, but still meaningfully closes the "unbounded anonymous abuse" gap.
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["200 per hour"],
+    storage_uri="memory://",
 )
 
 import time
@@ -284,6 +318,7 @@ def serialize_datetime(value):
 # ---------------- Upload ----------------
 
 @app.route('/api/upload', methods=['POST'])
+@limiter.limit("10 per minute")
 def upload_file():
     if 'pdf' not in request.files:
         return jsonify({"error": "No file part in the request"}), 400
@@ -324,9 +359,14 @@ def upload_file():
             return jsonify({"error": "Database connection is not available."}), 500
 
         try:
-            # Run ingest.py
+            # Run ingest.py - also pass file_id so it updates the exact
+            # document by _id instead of falling back to matching
+            # originalName against the SANITIZED filename, which silently
+            # created a ghost duplicate document for any filename
+            # secure_filename() changes (e.g. spaces -> underscores) and
+            # left "Processing..." stuck forever (see ingest.py's comment).
             print(f"Starting subprocess for ingest: {filepath}")
-            subprocess.Popen([sys.executable, 'ingest.py', filepath])
+            subprocess.Popen([sys.executable, 'ingest.py', filepath, file_id])
 
             # Run pass2main.py - passes the exact document _id (mirroring
             # how ingest.py already receives its file path above), so
@@ -344,7 +384,13 @@ def upload_file():
 
         return jsonify({
             "message": f"File '{filename}' uploaded. Processing started (analysis + explanation).",
-            "filename": filename,
+            # The ORIGINAL (unsanitized) filename - matches what's stored as
+            # files.originalName. Returning the sanitized `filename` here
+            # instead (as this used to) made the frontend poll
+            # /api/processing-status with a name that never matched the
+            # real document for any filename containing a space, which is
+            # the other half of the "stuck at 90%" bug above.
+            "filename": file.filename,
             # Lets the frontend target THIS specific document afterward (see
             # TutorTab's pending-file handoff) instead of falling back to
             # whatever was last cached or a "most recent upload" guess.
@@ -375,12 +421,22 @@ def check_processing_status(filename):
         
         # Check if explanation exists (indicates processing is complete)
         explanation = file_doc.get("explanation")
-        
+
         if explanation:
             return jsonify({
                 "status": "completed",
                 "message": "Processing completed successfully",
                 "hasExplanation": True
+            })
+        elif file_doc.get("status") == "failed":
+            # passmain_groq.py now marks this explicitly on any ingestion/
+            # summarization failure - previously there was no "failed"
+            # status at all, so a genuine failure was indistinguishable
+            # from "still processing" and the frontend just spun forever.
+            return jsonify({
+                "status": "failed",
+                "message": file_doc.get("error") or "Processing failed.",
+                "hasExplanation": False
             })
         else:
             return jsonify({
@@ -405,9 +461,14 @@ def get_files():
         # _id/uploadDate/size fields that the backend never actually sent -
         # now it does, so a stable fileId is available for the AI Tutor
         # endpoints instead of re-deriving a slug from the filename.
+        # Excludes corrupted/incomplete records (originalName: null) left
+        # over from failed upload insertions or old test runs - these used
+        # to be returned as-is, risking a frontend TypeError anywhere that
+        # assumes originalName is always a string (e.g. .endsWith(), .split()).
         docs = list(
             files_collection.find(
-                {}, {"originalName": 1, "uploadDate": 1, "fileSize": 1, "folder": 1}
+                {"originalName": {"$ne": None}},
+                {"originalName": 1, "uploadDate": 1, "fileSize": 1, "folder": 1}
             ).sort("uploadDate", -1)
         )
         files = [
@@ -482,6 +543,7 @@ def get_files():
 #         return jsonify({'error': str(e)}), 500
     
 @app.route('/api/qa', methods=['POST'])
+@limiter.limit("20 per minute")
 def ask_question():
     """
     This endpoint handles AI queries for both qa.html and learning.html
@@ -676,6 +738,7 @@ def get_links():
 # --- Learning Page: Kokoro TTS via fal.ai ---
 
 @app.route('/api/learning-tts', methods=['POST'])
+@limiter.limit("15 per minute")
 def learning_tts():
     """Synthesize speech for given text using GCP Text-to-Speech and store audio in MongoDB GridFS."""
     try:
@@ -903,6 +966,7 @@ def get_tts_audio(audio_id):
 # --- Q&A TTS via Groq Play.ai ---
 
 @app.route('/api/qa-tts', methods=['POST'])
+@limiter.limit("15 per minute")
 def qa_tts():
     try:
         data = request.get_json(force=True)
@@ -1017,6 +1081,7 @@ def qa_tts():
 # --- Voice Q&A (STT -> QA -> optional TTS) ---
 
 @app.route('/api/qa-voice', methods=['POST'])
+@limiter.limit("10 per minute")
 def qa_voice():
     try:
         if 'audio' not in request.files:
@@ -1155,6 +1220,7 @@ def qa_voice():
 # --- Lipsync video orchestration ---
 
 @app.route('/api/lipsync/generate', methods=['POST'])
+@limiter.limit("5 per minute")
 def generate_lipsync_video_endpoint():
     if not client:
         return jsonify({"error": "Database connection is not available."}), 500
@@ -1187,50 +1253,66 @@ def generate_lipsync_video_endpoint():
             except Exception as exc:
                 print(f"⚠️ [LIPSYNC-GENERATE] Warning: On-demand audio synthesis failed: {exc}")
 
-    try:
-        print(f"🎬 [LIPSYNC-ENDPOINT] Summary video generation requested for folder='{safe_folder}', audio_url='{audio_url_req}'")
-        result = generate_lipsync_video(target_folder=safe_folder, audio_url=audio_url_req)
-        print(f"🎉 [LIPSYNC-ENDPOINT] Summary video successfully generated: {result.get('video_filename')}")
-    except Exception as exc:
-        print(f"❌ [LIPSYNC-ENDPOINT] Summary video generation failed: {exc}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(exc)}), 500
+    def _run_generation_in_background(file_doc, file_name_req, safe_folder, audio_url_req):
+        """Does the actual (slow - Tavus polling can take up to 5 minutes)
+        video generation + MongoDB save, off the request thread. Runs in a
+        background thread rather than blocking the Flask worker that's
+        handling the HTTP request, which used to hold that worker (and any
+        reverse proxy in front of it, e.g. Render/Cloudflare, which time out
+        around 30-60s) for the ENTIRE duration - guaranteeing a 504 on every
+        real deployment. The frontend now polls the existing
+        /api/lipsync/latest endpoint instead of waiting on this response."""
+        try:
+            print(f"🎬 [LIPSYNC-BG] Summary video generation started for folder='{safe_folder}', audio_url='{audio_url_req}'")
+            result = generate_lipsync_video(target_folder=safe_folder, audio_url=audio_url_req)
+            print(f"🎉 [LIPSYNC-BG] Summary video successfully generated: {result.get('video_filename')}")
+        except Exception as exc:
+            print(f"❌ [LIPSYNC-BG] Summary video generation failed: {exc}")
+            import traceback
+            traceback.print_exc()
+            return
 
-    s3_video = result.get("s3_video")
-    final_video_url = s3_video["url"] if s3_video else build_collection_url(result.get("relative_path"))
+        s3_video = result.get("s3_video")
+        final_video_url = s3_video["url"] if s3_video else build_collection_url(result.get("relative_path"))
 
-    video_meta = {
-        "filename": result.get("video_filename"),
-        "relative_path": result.get("relative_path"),
-        "created_at": datetime.utcnow(),
-        "source_audio_key": (result.get("audio") or {}).get("key"),
-        "source_audio_url": (result.get("audio") or {}).get("url") or audio_url_req,
-        "tavus_video_id": (result.get("tavus") or {}).get("video_id"),
-        "video_url": final_video_url,
-    }
+        video_meta = {
+            "filename": result.get("video_filename"),
+            "relative_path": result.get("relative_path"),
+            "created_at": datetime.utcnow(),
+            "source_audio_key": (result.get("audio") or {}).get("key"),
+            "source_audio_url": (result.get("audio") or {}).get("url") or audio_url_req,
+            "tavus_video_id": (result.get("tavus") or {}).get("video_id"),
+            "video_url": final_video_url,
+        }
 
-    if file_doc:
-        files_collection.update_one({"_id": file_doc["_id"]}, {"$set": {"folder": safe_folder}})
-        files_collection.update_one({"_id": file_doc["_id"]}, {"$push": {"videos": video_meta}})
-        print(f"💾 [LIPSYNC-ENDPOINT] Saved video metadata to MongoDB for document _id={file_doc['_id']}")
-    else:
-        files_collection.insert_one({
-            "originalName": file_name_req or f"unnamed-video-{int(datetime.utcnow().timestamp())}",
-            "uploadDate": datetime.utcnow(),
-            "folder": safe_folder,
-            "videos": [video_meta]
-        })
+        if file_doc:
+            files_collection.update_one({"_id": file_doc["_id"]}, {"$set": {"folder": safe_folder}})
+            files_collection.update_one({"_id": file_doc["_id"]}, {"$push": {"videos": video_meta}})
+            print(f"💾 [LIPSYNC-BG] Saved video metadata to MongoDB for document _id={file_doc['_id']}")
+        else:
+            files_collection.insert_one({
+                "originalName": file_name_req or f"unnamed-video-{int(datetime.utcnow().timestamp())}",
+                "uploadDate": datetime.utcnow(),
+                "folder": safe_folder,
+                "videos": [video_meta]
+            })
 
-    payload = {
-        "video_url": final_video_url,
+    threading.Thread(
+        target=_run_generation_in_background,
+        args=(file_doc, file_name_req, safe_folder, audio_url_req),
+        daemon=True,
+    ).start()
+
+    # 202 Accepted: generation is running in the background. The frontend
+    # polls GET /api/lipsync/latest?fileName=... (already-existing endpoint,
+    # already wired on the frontend's auto-refresh poll) until a video with
+    # a created_at newer than this request shows up.
+    return jsonify({
+        "status": "generating",
         "folder": safe_folder,
-        "video_filename": video_meta["filename"],
-        "audio_key": video_meta["source_audio_key"],
-        "audio_url": video_meta["source_audio_url"],
-        "created_at": serialize_datetime(video_meta["created_at"]),
-    }
-    return jsonify(payload)
+        "message": "Video generation started - poll /api/lipsync/latest for the result.",
+        "requested_at": serialize_datetime(datetime.utcnow()),
+    }), 202
 
 
 @app.route('/api/lipsync/latest', methods=['GET'])
@@ -1318,10 +1400,17 @@ def upload_audio_s3_endpoint():
 # --- ASSESSMENT ---
 
 @app.route('/api/assessment/generate', methods=['GET'])
+@limiter.limit("15 per minute")
 def generate_question():
     try:
-        # Get the latest document from MongoDB
-        file_doc = files_collection.find_one({}, sort=[("uploadDate", -1)])
+        # Resolve by fileName so assessment questions match whichever
+        # document the student is actually viewing - this used to always
+        # grab the single most-recently-uploaded document regardless of
+        # which one was open, so switching documents (or just uploading a
+        # second one) silently produced questions on the WRONG topic.
+        # Falls back to most-recent only when no fileName is given at all.
+        file_name = (request.args.get('fileName') or '').strip() or None
+        file_doc, _ = resolve_file_context(file_name)
         if not file_doc or "explanation" not in file_doc:
             return jsonify({"error": "No explanation found in database"}), 404
 
@@ -1368,27 +1457,31 @@ def generate_question():
         else:
             final_response = response.strip()
 
-        return jsonify({"question": final_response})
+        return jsonify({"question": final_response, "fileName": file_doc.get("originalName")})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/assessment/submit', methods=['POST'])
+@limiter.limit("15 per minute")
 def submit_answer():
     try:
-        # Get the latest document explanation again
-        file_doc = files_collection.find_one({}, sort=[("uploadDate", -1)])
+        # Read input from frontend
+        data = request.json
+        question = data.get("question", "")
+        student_answer = data.get("answer", "")
+        file_name = (data.get("fileName") or "").strip() or None
+
+        # Resolve the SAME document the question was generated from (see
+        # generate_question's comment) rather than always the most-recently
+        # uploaded one, so feedback is graded against the right context.
+        file_doc, _ = resolve_file_context(file_name)
         if not file_doc or "explanation" not in file_doc:
             return jsonify({"error": "No explanation found in database"}), 404
 
         explanations = [item.get("explanation", "") for item in file_doc["explanation"]]
         combined_explanation = " ".join(explanations)
-
-        # Read input from frontend
-        data = request.json
-        question = data.get("question", "")
-        student_answer = data.get("answer", "")
 
         if not question or not student_answer:
             return jsonify({"error": "Both question and answer are required"}), 400
@@ -1923,21 +2016,31 @@ def ensure_tutor_lesson_audio(current_lesson, topic_id, file_id):
     cleaned_text = re.sub(r'\$\$|\$', '', cleaned_text)
     text_to_speak = cleaned_text[:3500].strip()
 
-    try:
-        audio_bytes = gcp_synthesize_speech(text_to_speak)
-        timestamp = int(time.time())
-        safe_topic = re.sub(r'[^a-zA-Z0-9_-]', '_', str(topic_id))
-        filename = f"tutor-{safe_topic}-{timestamp}.wav"
-        folder = str(file_id or "tutor-lessons")
-        s3_info = upload_audio_to_s3(audio_bytes, filename, folder=folder)
-        audio_url = s3_info["url"]
-        current_lesson["audio_url"] = audio_url
-        print(f"[TUTOR-TTS] Generated GCP TTS audio & uploaded to S3: {audio_url}")
-        return audio_url
-    except Exception as e:
-        print(f"[TUTOR-TTS] Warning: Failed to synthesize/upload tutor TTS audio: {e}")
-        current_lesson["audio_url"] = None
-        return None
+    # One retry on a transient failure (network blip, momentary GCP 5xx)
+    # before giving up - this used to fail permanently on the first error
+    # with no second attempt, silently leaving audio_url null for the rest
+    # of that lesson even when the very next call would have succeeded.
+    last_error = None
+    for attempt in range(2):
+        try:
+            audio_bytes = gcp_synthesize_speech(text_to_speak)
+            timestamp = int(time.time())
+            safe_topic = re.sub(r'[^a-zA-Z0-9_-]', '_', str(topic_id))
+            filename = f"tutor-{safe_topic}-{timestamp}.wav"
+            folder = str(file_id or "tutor-lessons")
+            s3_info = upload_audio_to_s3(audio_bytes, filename, folder=folder)
+            audio_url = s3_info["url"]
+            current_lesson["audio_url"] = audio_url
+            print(f"[TUTOR-TTS] Generated GCP TTS audio & uploaded to S3: {audio_url}")
+            return audio_url
+        except Exception as e:
+            last_error = e
+            if attempt == 0:
+                print(f"[TUTOR-TTS] Attempt 1 failed ({e}), retrying once...")
+
+    print(f"[TUTOR-TTS] Warning: Failed to synthesize/upload tutor TTS audio after retry: {last_error}")
+    current_lesson["audio_url"] = None
+    return None
 
 
 @app.route('/api/tutor/lesson/next', methods=['POST'])
@@ -2236,10 +2339,16 @@ def serve_collections(filename):
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve_react_app(path):
-    """Serve the React frontend for all routes"""
-    # Path to the built React app
-    react_build_path = os.path.join('..', 'NeuroFront', 'dist', 'spa')
-    
+    """Serve the React frontend for all routes - only relevant when this
+    Flask app is used to serve the built SPA directly (e.g. local full-stack
+    testing); the actual production deployment serves LearnFront separately
+    as its own static site, so this route is a convenience, not load-bearing.
+    Resolved relative to this file (not cwd) so it works regardless of where
+    the process is launched from, pointing at the real 'LearnFront' folder -
+    this used to hardcode an obsolete 'NeuroFront' directory name that no
+    longer exists, so every path 404'd whenever this route was actually hit."""
+    react_build_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'LearnFront', 'dist', 'spa')
+
     if path and os.path.exists(os.path.join(react_build_path, path)):
         # Serve static files (JS, CSS, images, etc.)
         return send_from_directory(react_build_path, path)

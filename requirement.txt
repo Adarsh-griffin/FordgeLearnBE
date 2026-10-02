@@ -3,6 +3,7 @@
 # ==========================================
 flask
 flask-cors
+flask-limiter
 pymongo
 groq
 pypdf
